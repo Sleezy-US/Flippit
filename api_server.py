@@ -476,7 +476,7 @@ async def start_trial(trial_signup: TrialSignup):
         # Create Stripe subscription with 7-day trial
         subscription = stripe.Subscription.create(
             customer=customer_id,
-            items=[{'price': 'price_pro_monthly_stripe_id'}],  # You'll need to create this in Stripe
+            items=[{'price': 'price_1RbtlsHH6XNAV6XKBbiwpO4K'}],  # You'll need to create this in Stripe
             trial_period_days=7,
             payment_behavior='default_incomplete',
             payment_settings={'save_default_payment_method': 'on_subscription'},
@@ -713,10 +713,10 @@ async def manage_subscription(management: SubscriptionManagement, user_id: int =
             
             # Get new Stripe price ID based on tier
             price_map = {
-                "pro": "price_pro_monthly_stripe_id",
-                "pro_yearly": "price_pro_yearly_stripe_id", 
-                "premium": "price_premium_monthly_stripe_id",
-                "premium_yearly": "price_premium_yearly_stripe_id"
+                "pro": "price_1RbtlsHH6XNAV6XKBbiwpO4K",
+                "pro_yearly": "price_1RbtnZHH6XNAV6XKoCvZdKQX", 
+                "premium": "price_1Rbtp7HH6XNAV6XKQPe7ow42",
+                "premium_yearly": "price_1RbtpcHH6XNAV6XKlfmvTpke"
             }
             
             if management.new_tier not in price_map:
@@ -942,10 +942,10 @@ async def stripe_webhook(request: Request):
                     # Determine tier from Stripe price
                     price_id = subscription['items']['data'][0]['price']['id']
                     tier_map = {
-                        "price_pro_monthly_stripe_id": "pro",
-                        "price_pro_yearly_stripe_id": "pro_yearly",
-                        "price_premium_monthly_stripe_id": "premium", 
-                        "price_premium_yearly_stripe_id": "premium_yearly"
+                        "price_1RbtlsHH6XNAV6XKBbiwpO4K": "pro",
+                        "price_1RbtnZHH6XNAV6XKoCvZdKQX": "pro_yearly",
+                        "price_1Rbtp7HH6XNAV6XKQPe7ow42": "premium", 
+                        "price_1RbtpcHH6XNAV6XKlfmvTpke": "premium_yearly"
                     }
                     
                     new_tier = tier_map.get(price_id, 'pro')
