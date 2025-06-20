@@ -1,4 +1,4 @@
-annotated-types==0.7.0
+xannotated-types==0.7.0
 anyio==4.9.0
 bcrypt==4.3.0
 beautifulsoup4==4.13.4
@@ -30,3 +30,4 @@ typing_extensions==4.14.0
 urllib3==2.5.0
 uvicorn==0.24.0
 firebase-admin==6.9.0
+uvicorn==0.34.3
