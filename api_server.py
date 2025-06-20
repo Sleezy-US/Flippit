@@ -6,7 +6,7 @@ from typing import List, Optional
 import asyncio
 import sqlite3
 import hashlib
-import jwt
+from jose import jwt
 from datetime import datetime, timedelta
 import os
 import threading
