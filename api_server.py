@@ -893,1240 +893,816 @@ async def start_trial(trial_signup: TrialSignup):
         # Create Stripe subscription with 7-day trial
         subscription = stripe.Subscription.create(
             customer=customer_id,
-            items=[{'price': 'price_1RbtlsHH6XNAV6XKBbiwpO4K'}],  # Your Pro price IDRetryJContinueEditpython           trial_period_days=7,
-           payment_behavior='default_incomplete',
-           payment_settings={'save_default_payment_method': 'on_subscription'},
-           expand=['latest_invoice.payment_intent']
-       )
-       
-       # Calculate trial end date
-       trial_ends = datetime.utcnow() + timedelta(days=7)
-       
-       # Update user with trial info
-       cursor.execute("""
-           UPDATE users 
-           SET subscription_tier = 'pro', is_trial = TRUE, trial_ends = ?,
-               stripe_subscription_id = ?, stripe_payment_method_id = ?
-           WHERE id = ?
-       """, (trial_ends, subscription.id, trial_signup.payment_method_id, user_id))
-       
-       conn.commit()
-       token = create_token(user_id)
-       
-       return {
-           "token": token,
-           "user_id": user_id,
-           "subscription_tier": "pro",
-           "is_trial": True,
-           "trial_ends": trial_ends.isoformat(),
-           "stripe_subscription_id": subscription.id,
-           "message": "🎉 7-day Pro trial started! You now have access to push notifications, price analytics, advanced filtering, and 15 car searches!"
-       }
-       
-   except stripe.error.StripeError as e:
-       raise HTTPException(status_code=400, detail=f"Payment error: {str(e)}")
-   except sqlite3.IntegrityError:
-       raise HTTPException(status_code=400, detail="Email already registered")
-   finally:
-       conn.close()
+            items=[{'price': 'price_1RbtlsHH6XNAV6XKBbiwpO4K'}],  # Your Pro price ID
+            trial_period_days=7,
+            payment_behavior='default_incomplete',
+            payment_settings={'save_default_payment_method': 'on_subscription'},
+            expand=['latest_invoice.payment_intent']
+        )
+        
+        # Calculate trial end date
+        trial_ends = datetime.utcnow() + timedelta(days=7)
+        
+        # Update user with trial info
+        cursor.execute("""
+            UPDATE users 
+            SET subscription_tier = 'pro', is_trial = TRUE, trial_ends = ?,
+                stripe_subscription_id = ?, stripe_payment_method_id = ?
+            WHERE id = ?
+        """, (trial_ends, subscription.id, trial_signup.payment_method_id, user_id))
+        
+        conn.commit()
+        token = create_token(user_id)
+        
+        return {
+            "token": token,
+            "user_id": user_id,
+            "subscription_tier": "pro",
+            "is_trial": True,
+            "trial_ends": trial_ends.isoformat(),
+            "stripe_subscription_id": subscription.id,
+            "message": "🎉 7-day Pro trial started! You now have access to push notifications, price analytics, advanced filtering, and 15 car searches!"
+        }
+        
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=f"Payment error: {str(e)}")
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    finally:
+        conn.close()
 
 @app.post("/login")
 async def login(user: UserLogin):
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   cursor.execute("""
-       SELECT id, password_hash, subscription_tier, is_trial, trial_ends, 
-              cancel_at_period_end, stripe_subscription_id 
-       FROM users WHERE email = ?
-   """, (user.email,))
-   db_user = cursor.fetchone()
-   
-   if not db_user or not verify_password(user.password, db_user[1]):
-       raise HTTPException(status_code=401, detail="Invalid credentials")
-   
-   user_id, _, current_tier, is_trial, trial_ends, cancel_at_period_end, stripe_sub_id = db_user
-   
-   # Check if trial has expired
-   if is_trial and trial_ends:
-       trial_end_dt = datetime.fromisoformat(trial_ends.replace('Z', '+00:00'))
-       if datetime.utcnow() > trial_end_dt:
-           # Trial expired - subscription should have auto-converted or been canceled
-           if stripe_sub_id:
-               try:
-                   subscription = stripe.Subscription.retrieve(stripe_sub_id)
-                   if subscription.status == 'active':
-                       # Trial converted to paid subscription
-                       cursor.execute("""
-                           UPDATE users SET is_trial = FALSE, trial_ends = NULL 
-                           WHERE id = ?
-                       """, (user_id,))
-                       is_trial = False
-                   else:
-                       # Subscription failed/canceled, downgrade to free
-                       cursor.execute("""
-                           UPDATE users SET subscription_tier = 'free', is_trial = FALSE,
-                                          trial_ends = NULL, stripe_subscription_id = NULL
-                           WHERE id = ?
-                       """, (user_id,))
-                       current_tier = 'free'
-                       is_trial = False
-               except stripe.error.StripeError:
-                   # Error checking Stripe, assume downgrade to free
-                   cursor.execute("""
-                       UPDATE users SET subscription_tier = 'free', is_trial = FALSE,
-                                      trial_ends = NULL 
-                       WHERE id = ?
-                   """, (user_id,))
-                   current_tier = 'free'
-                   is_trial = False
-           else:
-               # No Stripe subscription, downgrade to free
-               cursor.execute("""
-                   UPDATE users SET subscription_tier = 'free', is_trial = FALSE,
-                                  trial_ends = NULL 
-                   WHERE id = ?
-               """, (user_id,))
-               current_tier = 'free'
-               is_trial = False
-           
-           conn.commit()
-   
-   token = create_token(user_id)
-   conn.close()
-   
-   response = {
-       "token": token, 
-       "user_id": user_id,
-       "subscription_tier": current_tier
-   }
-   
-   if is_trial and trial_ends:
-       response["is_trial"] = True
-       response["trial_ends"] = trial_ends
-   
-   if cancel_at_period_end:
-       response["cancel_at_period_end"] = True
-   
-   return response
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT id, password_hash, subscription_tier, is_trial, trial_ends, 
+               cancel_at_period_end, stripe_subscription_id 
+        FROM users WHERE email = ?
+    """, (user.email,))
+    db_user = cursor.fetchone()
+    
+    if not db_user or not verify_password(user.password, db_user[1]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    user_id, _, current_tier, is_trial, trial_ends, cancel_at_period_end, stripe_sub_id = db_user
+    
+    # Check if trial has expired
+    if is_trial and trial_ends:
+        trial_end_dt = datetime.fromisoformat(trial_ends.replace('Z', '+00:00'))
+        if datetime.utcnow() > trial_end_dt:
+            # Trial expired - subscription should have auto-converted or been canceled
+            if stripe_sub_id:
+                try:
+                    subscription = stripe.Subscription.retrieve(stripe_sub_id)
+                    if subscription.status == 'active':
+                        # Trial converted to paid subscription
+                        cursor.execute("""
+                            UPDATE users SET is_trial = FALSE, trial_ends = NULL 
+                            WHERE id = ?
+                        """, (user_id,))
+                        is_trial = False
+                    else:
+                        # Subscription failed/canceled, downgrade to free
+                        cursor.execute("""
+                            UPDATE users SET subscription_tier = 'free', is_trial = FALSE,
+                                           trial_ends = NULL, stripe_subscription_id = NULL
+                            WHERE id = ?
+                        """, (user_id,))
+                        current_tier = 'free'
+                        is_trial = False
+                except stripe.error.StripeError:
+                    # Error checking Stripe, assume downgrade to free
+                    cursor.execute("""
+                        UPDATE users SET subscription_tier = 'free', is_trial = FALSE,
+                                       trial_ends = NULL 
+                        WHERE id = ?
+                    """, (user_id,))
+                    current_tier = 'free'
+                    is_trial = False
+            else:
+                # No Stripe subscription, downgrade to free
+                cursor.execute("""
+                    UPDATE users SET subscription_tier = 'free', is_trial = FALSE,
+                                   trial_ends = NULL 
+                    WHERE id = ?
+                """, (user_id,))
+                current_tier = 'free'
+                is_trial = False
+            
+            conn.commit()
+    
+    token = create_token(user_id)
+    conn.close()
+    
+    response = {
+        "token": token, 
+        "user_id": user_id,
+        "subscription_tier": current_tier
+    }
+    
+    if is_trial and trial_ends:
+        response["is_trial"] = True
+        response["trial_ends"] = trial_ends
+    
+    if cancel_at_period_end:
+        response["cancel_at_period_end"] = True
+    
+    return response
 
 @app.get("/subscription", response_model=SubscriptionResponse)
 async def get_subscription(user_id: int = Depends(verify_token)):
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   # Get user subscription with trial info
-   cursor.execute("""
-       SELECT subscription_tier, is_trial, trial_ends, gifted_by 
-       FROM users WHERE id = ?
-   """, (user_id,))
-   result = cursor.fetchone()
-   
-   if not result:
-       raise HTTPException(status_code=404, detail="User not found")
-   
-   tier, is_trial, trial_ends, gifted_by = result
-   
-   # Check if trial expired
-   if is_trial and trial_ends:
-       trial_end_dt = datetime.fromisoformat(trial_ends.replace('Z', '+00:00'))
-       if datetime.utcnow() > trial_end_dt:
-           cursor.execute("""
-               UPDATE users SET subscription_tier = 'free', is_trial = FALSE 
-               WHERE id = ?
-           """, (user_id,))
-           conn.commit()
-           tier = 'free'
-           is_trial = False
-   
-   # Map yearly tiers to base tier for limit calculations
-   base_tier = tier
-   if tier == 'pro_yearly':
-       base_tier = 'pro'
-   elif tier == 'premium_yearly':
-       base_tier = 'premium'
-   
-   limits = SUBSCRIPTION_LIMITS[base_tier]
-   
-   # Count current searches
-   cursor.execute("SELECT COUNT(*) FROM car_searches WHERE user_id = ? AND is_active = TRUE", (user_id,))
-   current_searches = cursor.fetchone()[0]
-   
-   conn.close()
-   
-   pricing = {
-       "free": "$0/month",
-       "pro": "$15/month", 
-       "pro_yearly": "$153/year (15% off)",
-       "premium": "$50/month",
-       "premium_yearly": "$480/year (20% off)"
-   }
-   
-   response = SubscriptionResponse(
-       tier=tier,
-       max_searches=limits['max_searches'],
-       current_searches=current_searches,
-       interval_minutes=limits['interval'] // 60,
-       features=limits['features'],
-       price=pricing[tier]
-   )
-   
-   # Add trial/gift info to response
-   if is_trial:
-       response.trial_ends = trial_ends
-   if gifted_by:
-       response.gifted_by = gifted_by
-   
-   return response
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Get user subscription with trial info
+    cursor.execute("""
+        SELECT subscription_tier, is_trial, trial_ends, gifted_by 
+        FROM users WHERE id = ?
+    """, (user_id,))
+    result = cursor.fetchone()
+    
+    if not result:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    tier, is_trial, trial_ends, gifted_by = result
+    
+    # Check if trial expired
+    if is_trial and trial_ends:
+        trial_end_dt = datetime.fromisoformat(trial_ends.replace('Z', '+00:00'))
+        if datetime.utcnow() > trial_end_dt:
+            cursor.execute("""
+                UPDATE users SET subscription_tier = 'free', is_trial = FALSE 
+                WHERE id = ?
+            """, (user_id,))
+            conn.commit()
+            tier = 'free'
+            is_trial = False
+    
+    # Map yearly tiers to base tier for limit calculations
+    base_tier = tier
+    if tier == 'pro_yearly':
+        base_tier = 'pro'
+    elif tier == 'premium_yearly':
+        base_tier = 'premium'
+    
+    limits = SUBSCRIPTION_LIMITS[base_tier]
+    
+    # Count current searches
+    cursor.execute("SELECT COUNT(*) FROM car_searches WHERE user_id = ? AND is_active = TRUE", (user_id,))
+    current_searches = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    pricing = {
+        "free": "$0/month",
+        "pro": "$15/month", 
+        "pro_yearly": "$153/year (15% off)",
+        "premium": "$50/month",
+        "premium_yearly": "$480/year (20% off)"
+    }
+    
+    response = SubscriptionResponse(
+        tier=tier,
+        max_searches=limits['max_searches'],
+        current_searches=current_searches,
+        interval_minutes=limits['interval'] // 60,
+        features=limits['features'],
+        price=pricing[tier]
+    )
+    
+    # Add trial/gift info to response
+    if is_trial:
+        response.trial_ends = trial_ends
+    if gifted_by:
+        response.gifted_by = gifted_by
+    
+    return response
 
 @app.post("/manage-subscription")
 async def manage_subscription(management: SubscriptionManagement, user_id: int = Depends(verify_token)):
-   """Cancel, reactivate, or change subscription plan"""
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   cursor.execute("""
-       SELECT stripe_subscription_id, subscription_tier, cancel_at_period_end 
-       FROM users WHERE id = ?
-   """, (user_id,))
-   result = cursor.fetchone()
-   
-   if not result or not result[0]:
-       raise HTTPException(status_code=404, detail="No active subscription found")
-   
-   stripe_sub_id, current_tier, cancel_at_period_end = result
-   
-   try:
-       if management.action == "cancel":
-           # Cancel at end of billing period
-           stripe.Subscription.modify(
-               stripe_sub_id,
-               cancel_at_period_end=True
-           )
-           
-           cursor.execute("""
-               UPDATE users SET cancel_at_period_end = TRUE WHERE id = ?
-           """, (user_id,))
-           
-           message = "Subscription will cancel at the end of your current billing period"
-           
-       elif management.action == "reactivate":
-           # Reactivate canceled subscription
-           stripe.Subscription.modify(
-               stripe_sub_id,
-               cancel_at_period_end=False
-           )
-           
-           cursor.execute("""
-               UPDATE users SET cancel_at_period_end = FALSE WHERE id = ?
-           """, (user_id,))
-           
-           message = "Subscription reactivated - you will continue to be billed"
-           
-       elif management.action == "change_plan":
-           if not management.new_tier:
-               raise HTTPException(status_code=400, detail="new_tier required for plan change")
-           
-           # Get new Stripe price ID based on tier
-           price_map = {
-               "pro": "price_1RbtlsHH6XNAV6XKBbiwpO4K",
-               "pro_yearly": "price_1RbtnZHH6XNAV6XKoCvZdKQX", 
-               "premium": "price_1Rbtp7HH6XNAV6XKQPe7ow42",
-               "premium_yearly": "price_1RbtpcHH6XNAV6XKlfmvTpke"
-           }
-           
-           if management.new_tier not in price_map:
-               raise HTTPException(status_code=400, detail="Invalid subscription tier")
-           
-           # Update Stripe subscription
-           subscription = stripe.Subscription.retrieve(stripe_sub_id)
-           stripe.Subscription.modify(
-               stripe_sub_id,
-               items=[{
-                   'id': subscription['items']['data'][0]['id'],
-                   'price': price_map[management.new_tier]
-               }],
-               proration_behavior='immediate_with_unused_time'
-           )
-           
-           cursor.execute("""
-               UPDATE users SET subscription_tier = ? WHERE id = ?
-           """, (management.new_tier, user_id))
-           
-           message = f"Subscription changed to {management.new_tier}"
-           
-       else:
-           raise HTTPException(status_code=400, detail="Invalid action")
-       
-       conn.commit()
-       conn.close()
-       
-       return {"message": message, "action": management.action}
-       
-   except stripe.error.StripeError as e:
-       raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
+    """Cancel, reactivate, or change subscription plan"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT stripe_subscription_id, subscription_tier, cancel_at_period_end 
+        FROM users WHERE id = ?
+    """, (user_id,))
+    result = cursor.fetchone()
+    
+    if not result or not result[0]:
+        raise HTTPException(status_code=404, detail="No active subscription found")
+    
+    stripe_sub_id, current_tier, cancel_at_period_end = result
+    
+    try:
+        if management.action == "cancel":
+            # Cancel at end of billing period
+            stripe.Subscription.modify(
+                stripe_sub_id,
+                cancel_at_period_end=True
+            )
+            
+            cursor.execute("""
+                UPDATE users SET cancel_at_period_end = TRUE WHERE id = ?
+            """, (user_id,))
+            
+            message = "Subscription will cancel at the end of your current billing period"
+            
+        elif management.action == "reactivate":
+            # Reactivate canceled subscription
+            stripe.Subscription.modify(
+                stripe_sub_id,
+                cancel_at_period_end=False
+            )
+            
+            cursor.execute("""
+                UPDATE users SET cancel_at_period_end = FALSE WHERE id = ?
+            """, (user_id,))
+            
+            message = "Subscription reactivated - you will continue to be billed"
+            
+        elif management.action == "change_plan":
+            if not management.new_tier:
+                raise HTTPException(status_code=400, detail="new_tier required for plan change")
+            
+            # Get new Stripe price ID based on tier
+            price_map = {
+                "pro": "price_1RbtlsHH6XNAV6XKBbiwpO4K",
+                "pro_yearly": "price_1RbtnZHH6XNAV6XKoCvZdKQX", 
+                "premium": "price_1Rbtp7HH6XNAV6XKQPe7ow42",
+                "premium_yearly": "price_1RbtpcHH6XNAV6XKlfmvTpke"
+            }
+            
+            if management.new_tier not in price_map:
+                raise HTTPException(status_code=400, detail="Invalid subscription tier")
+            
+            # Update Stripe subscription
+            subscription = stripe.Subscription.retrieve(stripe_sub_id)
+            stripe.Subscription.modify(
+                stripe_sub_id,
+                items=[{
+                    'id': subscription['items']['data'][0]['id'],
+                    'price': price_map[management.new_tier]
+                }],
+                proration_behavior='immediate_with_unused_time'
+            )
+            
+            cursor.execute("""
+                UPDATE users SET subscription_tier = ? WHERE id = ?
+            """, (management.new_tier, user_id))
+            
+            message = f"Subscription changed to {management.new_tier}"
+            
+        else:
+            raise HTTPException(status_code=400, detail="Invalid action")
+        
+        conn.commit()
+        conn.close()
+        
+        return {"message": message, "action": management.action}
+        
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
 
 # NEW ENHANCED ENDPOINTS
 
 @app.post("/push-token")
 async def register_push_token(token_data: PushNotificationToken, user_id: int = Depends(verify_token)):
-   """Register push notification token - Pro feature"""
-   if not check_feature_access(user_id, 'push_notifications'):
-       raise HTTPException(
-           status_code=403, 
-           detail="Push notifications require Pro subscription. Upgrade to get instant alerts!"
-       )
-   
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   # Deactivate old tokens for this user/platform
-   cursor.execute("""
-       UPDATE push_tokens SET is_active = FALSE 
-       WHERE user_id = ? AND platform = ?
-   """, (user_id, token_data.platform))
-   
-   # Insert new token
-   cursor.execute("""
-       INSERT OR REPLACE INTO push_tokens (user_id, token, platform, is_active)
-       VALUES (?, ?, ?, TRUE)
-   """, (user_id, token_data.token, token_data.platform))
-   
-   conn.commit()
-   conn.close()
-   
-   return {"message": "Push token registered successfully"}
+    """Register push notification token - Pro feature"""
+    if not check_feature_access(user_id, 'push_notifications'):
+        raise HTTPException(
+            status_code=403, 
+            detail="Push notifications require Pro subscription. Upgrade to get instant alerts!"
+        )
+    
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Deactivate old tokens for this user/platform
+    cursor.execute("""
+        UPDATE push_tokens SET is_active = FALSE 
+        WHERE user_id = ? AND platform = ?
+    """, (user_id, token_data.platform))
+    
+    # Insert new token
+    cursor.execute("""
+        INSERT OR REPLACE INTO push_tokens (user_id, token, platform, is_active)
+        VALUES (?, ?, ?, TRUE)
+    """, (user_id, token_data.token, token_data.platform))
+    
+    conn.commit()
+    conn.close()
+    
+    return {"message": "Push token registered successfully"}
 
 @app.put("/car-searches/{search_id}")
 async def update_car_search(search_id: int, search: CarSearchUpdate, user_id: int = Depends(verify_token)):
-   """Update existing car search - EDIT FUNCTIONALITY"""
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   # Verify ownership
-   cursor.execute("SELECT user_id FROM car_searches WHERE id = ?", (search_id,))
-   search_owner = cursor.fetchone()
-   
-   if not search_owner or search_owner[0] != user_id:
-       raise HTTPException(status_code=404, detail="Search not found")
-   
-   # Build update query dynamically
-   update_fields = []
-   values = []
-   
-   for field, value in search.dict(exclude_unset=True).items():
-       update_fields.append(f"{field} = ?")
-       values.append(value)
-   
-   if update_fields:
-       values.append(search_id)
-       cursor.execute(f"""
-           UPDATE car_searches 
-           SET {', '.join(update_fields)}
-           WHERE id = ?
-       """, values)
-       
-       conn.commit()
-   
-   conn.close()
-   return {"message": "Search updated successfully"}
+    """Update existing car search - EDIT FUNCTIONALITY"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Verify ownership
+    cursor.execute("SELECT user_id FROM car_searches WHERE id = ?", (search_id,))
+    search_owner = cursor.fetchone()
+    
+    if not search_owner or search_owner[0] != user_id:
+        raise HTTPException(status_code=404, detail="Search not found")
+    
+    # Build update query dynamically
+    update_fields = []
+    values = []
+    
+    for field, value in search.dict(exclude_unset=True).items():
+        update_fields.append(f"{field} = ?")
+        values.append(value)
+    
+    if update_fields:
+        values.append(search_id)
+        cursor.execute(f"""
+            UPDATE car_searches 
+            SET {', '.join(update_fields)}
+            WHERE id = ?
+        """, values)
+        
+        conn.commit()
+    
+    conn.close()
+    return {"message": "Search updated successfully"}
 
 @app.get("/car-listings")
 async def get_all_car_listings(
-   user_id: int = Depends(verify_token),
-   sort_by: str = "found_at",
-   order: str = "desc",
-   make: Optional[str] = None,
-   model: Optional[str] = None,
-   min_year: Optional[int] = None,
-   max_year: Optional[int] = None,
-   min_price: Optional[int] = None,
-   max_price: Optional[int] = None,
-   max_distance: Optional[float] = None,
-   limit: int = 50
+    user_id: int = Depends(verify_token),
+    sort_by: str = "found_at",
+    order: str = "desc",
+    make: Optional[str] = None,
+    model: Optional[str] = None,
+    min_year: Optional[int] = None,
+    max_year: Optional[int] = None,
+    min_price: Optional[int] = None,
+    max_price: Optional[int] = None,
+    max_distance: Optional[float] = None,
+    limit: int = 50
 ):
-   """Get all car listings with advanced filtering and sorting"""
-   # Check if user has advanced filtering access
-   if sort_by != "found_at" or make or model or min_year or max_year or min_price or max_price:
-       if not check_feature_access(user_id, 'advanced_filtering'):
-           raise HTTPException(
-               status_code=403,
-               detail="Advanced filtering requires Pro subscription. Upgrade for powerful search tools!"
-           )
-   
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   # Base query
-   query = """
-       SELECT cl.*, ds.deal_score, ds.quality_indicators,
-              CASE WHEN f.id IS NOT NULL THEN 1 ELSE 0 END as is_favorite
-       FROM car_listings cl
-       JOIN car_searches cs ON cl.search_id = cs.id
-       LEFT JOIN deal_scores ds ON cl.id = ds.listing_id
-       LEFT JOIN favorites f ON cl.id = f.listing_id AND f.user_id = ?
-       WHERE cs.user_id = ?
-   """
-   
-   params = [user_id, user_id]
-   
-   # Add filters
-   if make:
-       query += " AND (cl.title LIKE ? OR cs.make LIKE ?)"
-       params.extend([f"%{make}%", f"%{make}%"])
-   
-   if model:
-       query += " AND (cl.title LIKE ? OR cs.model LIKE ?)"
-       params.extend([f"%{model}%", f"%{model}%"])
-   
-   if min_year:
-       query += " AND CAST(cl.year as INTEGER) >= ?"
-       params.append(min_year)
-   
-   if max_year:
-       query += " AND CAST(cl.year as INTEGER) <= ?"
-       params.append(max_year)
-   
-   if min_price:
-       query += " AND CAST(REPLACE(REPLACE(cl.price, '$', ''), ',', '') as INTEGER) >= ?"
-       params.append(min_price)
-   
-   if max_price:
-       query += " AND CAST(REPLACE(REPLACE(cl.price, '$', ''), ',', '') as INTEGER) <= ?"
-       params.append(max_price)
-   
-   if max_distance:
-       query += " AND cl.distance_miles <= ?"
-       params.append(max_distance)
-   
-   # Add sorting
-   valid_sort_fields = ["found_at", "price", "year", "mileage", "distance_miles", "deal_score"]
-   if sort_by in valid_sort_fields:
-       order_dir = "DESC" if order.lower() == "desc" else "ASC"
-       
-       if sort_by == "price":
-           query += f" ORDER BY CAST(REPLACE(REPLACE(cl.price, '$', ''), ',', '') as INTEGER) {order_dir}"
-       elif sort_by == "year":
-           query += f" ORDER BY CAST(cl.year as INTEGER) {order_dir}"
-       elif sort_by == "mileage":
-           query += f" ORDER BY CAST(REPLACE(REPLACE(cl.mileage, ',', ''), ' miles', '') as INTEGER) {order_dir}"
-       else:
-           query += f" ORDER BY cl.{sort_by} {order_dir}"
-   else:
-       query += " ORDER BY cl.found_at DESC"
-   
-   query += f" LIMIT {limit}"
-   
-   cursor.execute(query, params)
-   rows = cursor.fetchall()
-   conn.close()
-   
-   # Convert to enhanced response format
-   listings = []
-   for row in rows:
-       quality_indicators = {}
-       if len(row) > 17 and row[17]:  # quality_indicators column
-           try:
-               quality_indicators = json.loads(row[17])
-           except:
-               quality_indicators = {}
-       
-       listing = {
-           "id": row[0],
-           "title": row[2],
-           "price": row[3],
-           "year": row[4],
-           "mileage": row[5],
-           "url": row[6],
-           "found_at": row[7],
-           "fuel_type": row[9] if len(row) > 9 else None,
-           "transmission": row[10] if len(row) > 10 else None,
-           "body_style": row[11] if len(row) > 11 else None,
-           "color": row[12] if len(row) > 12 else None,
-           "distance_miles": row[15] if len(row) > 15 else None,
-           "deal_score": row[16] if len(row) > 16 else None,
-           "quality_indicators": quality_indicators,
-           "is_favorite": bool(row[18]) if len(row) > 18 else False
-       }
-       listings.append(listing)
-   
-   return {"listings": listings, "total": len(listings)}
+    """Get all car listings with advanced filtering and sorting"""
+    # Check if user has advanced filtering access
+    if sort_by != "found_at" or make or model or min_year or max_year or min_price or max_price:
+        if not check_feature_access(user_id, 'advanced_filtering'):
+            raise HTTPException(
+                status_code=403,
+                detail="Advanced filtering requires Pro subscription. Upgrade for powerful search tools!"
+            )
+    
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Base query
+    query = """
+        SELECT cl.*, ds.deal_score, ds.quality_indicators,
+               CASE WHEN f.id IS NOT NULL THEN 1 ELSE 0 END as is_favorite
+        FROM car_listings cl
+        JOIN car_searches cs ON cl.search_id = cs.id
+        LEFT JOIN deal_scores ds ON cl.id = ds.listing_id
+        LEFT JOIN favorites f ON cl.id = f.listing_id AND f.user_id = ?
+        WHERE cs.user_id = ?
+    """
+    
+    params = [user_id, user_id]
+    
+    # Add filters
+    if make:
+        query += " AND (cl.title LIKE ? OR cs.make LIKE ?)"
+        params.extend([f"%{make}%", f"%{make}%"])
+    
+    if model:
+        query += " AND (cl.title LIKE ? OR cs.model LIKE ?)"
+        params.extend([f"%{model}%", f"%{model}%"])
+    
+    if min_year:
+        query += " AND CAST(cl.year as INTEGER) >= ?"
+        params.append(min_year)
+    
+    if max_year:
+        query += " AND CAST(cl.year as INTEGER) <= ?"
+        params.append(max_year)
+    
+    if min_price:
+        query += " AND CAST(REPLACE(REPLACE(cl.price, ', ''), ',', '') as INTEGER) >= ?"
+        params.append(min_price)
+    
+    if max_price:
+        query += " AND CAST(REPLACE(REPLACE(cl.price, ', ''), ',', '') as INTEGER) <= ?"
+        params.append(max_price)
+    
+    if max_distance:
+        query += " AND cl.distance_miles <= ?"
+        params.append(max_distance)
+    
+    # Add sorting
+    valid_sort_fields = ["found_at", "price", "year", "mileage", "distance_miles", "deal_score"]
+    if sort_by in valid_sort_fields:
+        order_dir = "DESC" if order.lower() == "desc" else "ASC"
+        
+        if sort_by == "price":
+            query += f" ORDER BY CAST(REPLACE(REPLACE(cl.price, ', ''), ',', '') as INTEGER) {order_dir}"
+        elif sort_by == "year":
+            query += f" ORDER BY CAST(cl.year as INTEGER) {order_dir}"
+        elif sort_by == "mileage":
+            query += f" ORDER BY CAST(REPLACE(REPLACE(cl.mileage, ',', ''), ' miles', '') as INTEGER) {order_dir}"
+        else:
+            query += f" ORDER BY cl.{sort_by} {order_dir}"
+    else:
+        query += " ORDER BY cl.found_at DESC"
+    
+    query += f" LIMIT {limit}"
+    
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    
+    # Convert to enhanced response format
+    listings = []
+    for row in rows:
+        quality_indicators = {}
+        if len(row) > 17 and row[17]:  # quality_indicators column
+            try:
+                quality_indicators = json.loads(row[17])
+            except:
+                quality_indicators = {}
+        
+        listing = {
+            "id": row[0],
+            "title": row[2],
+            "price": row[3],
+            "year": row[4],
+            "mileage": row[5],
+            "url": row[6],
+            "found_at": row[7],
+            "fuel_type": row[9] if len(row) > 9 else None,
+            "transmission": row[10] if len(row) > 10 else None,
+            "body_style": row[11] if len(row) > 11 else None,
+            "color": row[12] if len(row) > 12 else None,
+            "distance_miles": row[15] if len(row) > 15 else None,
+            "deal_score": row[16] if len(row) > 16 else None,
+            "quality_indicators": quality_indicators,
+            "is_favorite": bool(row[18]) if len(row) > 18 else False
+        }
+        listings.append(listing)
+    
+    return {"listings": listings, "total": len(listings)}
 
 @app.post("/favorites/{listing_id}")
 async def add_favorite(listing_id: int, user_id: int = Depends(verify_token)):
-   """Add car to favorites"""
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   try:
-       cursor.execute("""
-           INSERT INTO favorites (user_id, listing_id)
-           VALUES (?, ?)
-       """, (user_id, listing_id))
-       conn.commit()
-       return {"message": "Added to favorites"}
-   except sqlite3.IntegrityError:
-       raise HTTPException(status_code=400, detail="Already in favorites")
-   finally:
-       conn.close()
+    """Add car to favorites"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO favorites (user_id, listing_id)
+            VALUES (?, ?)
+        """, (user_id, listing_id))
+        conn.commit()
+        return {"message": "Added to favorites"}
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="Already in favorites")
+    finally:
+        conn.close()
 
 @app.delete("/favorites/{listing_id}")
 async def remove_favorite(listing_id: int, user_id: int = Depends(verify_token)):
-   """Remove car from favorites"""
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   cursor.execute("""
-       DELETE FROM favorites 
-       WHERE user_id = ? AND listing_id = ?
-   """, (user_id, listing_id))
-   
-   if cursor.rowcount == 0:
-       raise HTTPException(status_code=404, detail="Not in favorites")
-   
-   conn.commit()
-   conn.close()
-   return {"message": "Removed from favorites"}
+    """Remove car from favorites"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        DELETE FROM favorites 
+        WHERE user_id = ? AND listing_id = ?
+    """, (user_id, listing_id))
+    
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Not in favorites")
+    
+    conn.commit()
+    conn.close()
+    return {"message": "Removed from favorites"}
 
 @app.get("/favorites")
 async def get_favorites(user_id: int = Depends(verify_token)):
-   """Get user's favorite cars"""
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   cursor.execute("""
-       SELECT cl.*, ds.deal_score, ds.quality_indicators
-       FROM car_listings cl
-       JOIN favorites f ON cl.id = f.listing_id
-       LEFT JOIN deal_scores ds ON cl.id = ds.listing_id
-       WHERE f.user_id = ?
-       ORDER BY f.created_at DESC
-   """, (user_id,))
-   
-   rows = cursor.fetchall()
-   conn.close()
-   
-   favorites = []
-   for row in rows:
-       quality_indicators = {}
-       if len(row) > 17 and row[17]:
-           try:
-               quality_indicators = json.loads(row[17])
-           except:
-               quality_indicators = {}
-       
-       favorite = {
-           "id": row[0],
-           "title": row[2],
-           "price": row[3],
-           "year": row[4],
-           "mileage": row[5],
-           "url": row[6],
-           "found_at": row[7],
-           "deal_score": row[16] if len(row) > 16 else None,
-           "quality_indicators": quality_indicators,
-           "is_favorite": True
-       }
-       favorites.append(favorite)
-   
-   return {"favorites": favorites}
+    """Get user's favorite cars"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT cl.*, ds.deal_score, ds.quality_indicators
+        FROM car_listings cl
+        JOIN favorites f ON cl.id = f.listing_id
+        LEFT JOIN deal_scores ds ON cl.id = ds.listing_id
+        WHERE f.user_id = ?
+        ORDER BY f.created_at DESC
+    """, (user_id,))
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    favorites = []
+    for row in rows:
+        quality_indicators = {}
+        if len(row) > 17 and row[17]:
+            try:
+                quality_indicators = json.loads(row[17])
+            except:
+                quality_indicators = {}
+        
+        favorite = {
+            "id": row[0],
+            "title": row[2],
+            "price": row[3],
+            "year": row[4],
+            "mileage": row[5],
+            "url": row[6],
+            "found_at": row[7],
+            "deal_score": row[16] if len(row) > 16 else None,
+            "quality_indicators": quality_indicators,
+            "is_favorite": True
+        }
+        favorites.append(favorite)
+    
+    return {"favorites": favorites}
 
 @app.post("/car-notes/{listing_id}")
 async def add_car_note(listing_id: int, note_data: CarNote, user_id: int = Depends(verify_token)):
-   """Add note to a car listing - Pro feature"""
-   if not check_feature_access(user_id, 'car_notes'):
-       raise HTTPException(
-           status_code=403,
-           detail="Car notes require Pro subscription. Upgrade to organize your car search!"
-       )
-   
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   cursor.execute("""
-       INSERT OR REPLACE INTO car_notes (user_id, listing_id, note, updated_at)
-       VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-   """, (user_id, listing_id, note_data.note))
-   
-   conn.commit()
-   conn.close()
-   return {"message": "Note added successfully"}
+    """Add note to a car listing - Pro feature"""
+    if not check_feature_access(user_id, 'car_notes'):
+        raise HTTPException(
+            status_code=403,
+            detail="Car notes require Pro subscription. Upgrade to organize your car search!"
+        )
+    
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        INSERT OR REPLACE INTO car_notes (user_id, listing_id, note, updated_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+    """, (user_id, listing_id, note_data.note))
+    
+    conn.commit()
+    conn.close()
+    return {"message": "Note added successfully"}
 
 @app.get("/car-notes/{listing_id}")
 async def get_car_note(listing_id: int, user_id: int = Depends(verify_token)):
-   """Get note for a car listing"""
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   cursor.execute("""
-       SELECT note, status, updated_at 
-       FROM car_notes 
-       WHERE user_id = ? AND listing_id = ?
-   """, (user_id, listing_id))
-   
-   result = cursor.fetchone()
-   conn.close()
-   
-   if result:
-       return {
-           "note": result[0],
-           "status": result[1],
-           "updated_at": result[2]
-       }
-   else:
-       return {"note": None, "status": None, "updated_at": None}
+    """Get note for a car listing"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT note, status, updated_at 
+        FROM car_notes 
+        WHERE user_id = ? AND listing_id = ?
+    """, (user_id, listing_id))
+    
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result:
+        return {
+            "note": result[0],
+            "status": result[1],
+            "updated_at": result[2]
+        }
+    else:
+        return {"note": None, "status": None, "updated_at": None}
 
 @app.get("/search-suggestions")
 async def get_search_suggestions(query: str = ""):
-   """Get search suggestions for make/model autocomplete"""
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   if query:
-       cursor.execute("""
-           SELECT make, model, search_count 
-           FROM search_suggestions 
-           WHERE make LIKE ? OR model LIKE ?
-           ORDER BY search_count DESC 
-           LIMIT 10
-       """, (f"%{query}%", f"%{query}%"))
-   else:
-       cursor.execute("""
-           SELECT make, model, search_count 
-           FROM search_suggestions 
-           ORDER BY search_count DESC 
-           LIMIT 20
-       """)
-   
-   rows = cursor.fetchall()
-   conn.close()
-   
-   suggestions = []
-   for row in rows:
-       if row[0]:  # make
-           suggestions.append({"type": "make", "value": row[0], "popularity": row[2]})
-       if row[1]:  # model
-           suggestions.append({"type": "model", "value": row[1], "popularity": row[2]})
-   
-   return {"suggestions": suggestions}
+    """Get search suggestions for make/model autocomplete"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    if query:
+        cursor.execute("""
+            SELECT make, model, search_count 
+            FROM search_suggestions 
+            WHERE make LIKE ? OR model LIKE ?
+            ORDER BY search_count DESC 
+            LIMIT 10
+        """, (f"%{query}%", f"%{query}%"))
+    else:
+        cursor.execute("""
+            SELECT make, model, search_count 
+            FROM search_suggestions 
+            ORDER BY search_count DESC 
+            LIMIT 20
+        """)
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    suggestions = []
+    for row in rows:
+        if row[0]:  # make
+            suggestions.append({"type": "make", "value": row[0], "popularity": row[2]})
+        if row[1]:  # model
+            suggestions.append({"type": "model", "value": row[1], "popularity": row[2]})
+    
+    return {"suggestions": suggestions}
 
 @app.get("/price-analytics")
 async def get_price_analytics(
-   make: str,
-   model: Optional[str] = None,
-   year: Optional[int] = None,
-   user_id: int = Depends(verify_token)
+    make: str,
+    model: Optional[str] = None,
+    year: Optional[int] = None,
+    user_id: int = Depends(verify_token)
 ):
-   """Get price analytics for a specific make/model - Pro feature"""
-   if not check_feature_access(user_id, 'price_analytics'):
-       raise HTTPException(
-           status_code=403,
-           detail="Price analytics require Pro subscription. Upgrade for market insights!"
-       )
-   
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   # Build query for historical data
-   query = """
-       SELECT price, mileage, recorded_at 
-       FROM price_history 
-       WHERE make LIKE ?
-   """
-   params = [f"%{make}%"]
-   
-   if model:
-       query += " AND model LIKE ?"
-       params.append(f"%{model}%")
-   
-   if year:
-       query += " AND year = ?"
-       params.append(year)
-   
-   query += " ORDER BY recorded_at DESC LIMIT 100"
-   
-   cursor.execute(query, params)
-   rows = cursor.fetchall()
-   conn.close()
-   
-   if not rows:
-       return {
-           "message": "Not enough data for analysis",
-           "average_price": None,
-           "price_trend": None,
-           "market_analysis": None
-       }
-   
-   # Calculate analytics
-   prices = [row[0] for row in rows if row[0]]
-   
-   if not prices:
-       return {
-           "message": "No price data available",
-           "average_price": None
-       }
-   
-   analytics = {
-       "average_price": round(statistics.mean(prices)),
-       "median_price": round(statistics.median(prices)),
-       "price_range": {
-           "min": min(prices),
-           "max": max(prices)
-       },
-       "total_listings": len(rows),
-       "price_distribution": {
-           "below_20k": len([p for p in prices if p < 20000]),
-           "20k_to_35k": len([p for p in prices if 20000 <= p < 35000]),
-           "35k_to_50k": len([p for p in prices if 35000 <= p < 50000]),
-           "above_50k": len([p for p in prices if p >= 50000])
-       }
-   }
-   
-   return analytics
+    """Get price analytics for a specific make/model - Pro feature"""
+    if not check_feature_access(user_id, 'price_analytics'):
+        raise HTTPException(
+            status_code=403,
+            detail="Price analytics require Pro subscription. Upgrade for market insights!"
+        )
+    
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Build query for historical data
+    query = """
+        SELECT price, mileage, recorded_at 
+        FROM price_history 
+        WHERE make LIKE ?
+    """
+    params = [f"%{make}%"]
+    
+    if model:
+        query += " AND model LIKE ?"
+        params.append(f"%{model}%")
+    
+    if year:
+        query += " AND year = ?"
+        params.append(year)
+    
+    query += " ORDER BY recorded_at DESC LIMIT 100"
+    
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    
+    if not rows:
+        return {
+            "message": "Not enough data for analysis",
+            "average_price": None,
+            "price_trend": None,
+            "market_analysis": None
+        }
+    
+    # Calculate analytics
+    prices = [row[0] for row in rows if row[0]]
+    
+    if not prices:
+        return {
+            "message": "No price data available",
+            "average_price": None
+        }
+    
+    analytics = {
+        "average_price": round(statistics.mean(prices)),
+        "median_price": round(statistics.median(prices)),
+        "price_range": {
+            "min": min(prices),
+            "max": max(prices)
+        },
+        "total_listings": len(rows),
+        "price_distribution": {
+            "below_20k": len([p for p in prices if p < 20000]),
+            "20k_to_35k": len([p for p in prices if 20000 <= p < 35000]),
+            "35k_to_50k": len([p for p in prices if 35000 <= p < 50000]),
+            "above_50k": len([p for p in prices if p >= 50000])
+        }
+    }
+    
+    return analytics
 
 @app.get("/map-data")
 async def get_map_data(
-   user_id: int = Depends(verify_token),
-   search_id: Optional[int] = None
+    user_id: int = Depends(verify_token),
+    search_id: Optional[int] = None
 ):
-   """Get car listings with location data for map view - Premium feature"""
-   if not check_feature_access(user_id, 'map_view'):
-       raise HTTPException(
-           status_code=403,
-           detail="Map view requires Premium subscription. Upgrade for location features!"
-       )
-   
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   query = """
-       SELECT cl.id, cl.title, cl.price, cl.location_lat, cl.location_lng, 
-              cl.url, ds.deal_score
-       FROM car_listings cl
-       JOIN car_searches cs ON cl.search_id = cs.id
-       LEFT JOIN deal_scores ds ON cl.id = ds.listing_id
-       WHERE cs.user_id = ? AND cl.location_lat IS NOT NULL AND cl.location_lng IS NOT NULL
-   """
-   
-   params = [user_id]
-   
-   if search_id:
-       query += " AND cs.id = ?"
-       params.append(search_id)
-   
-   cursor.execute(query, params)
-   rows = cursor.fetchall()
-   conn.close()
-   
-   map_points = []
-   for row in rows:
-       map_points.append({
-           "id": row[0],
-           "title": row[1],
-           "price": row[2],
-           "latitude": row[3],
-           "longitude": row[4],
-           "url": row[5],
-           "deal_score": row[6]
-       })
-   
-   return {"map_points": map_points}
+    """Get car listings with location data for map view - Premium feature"""
+    if not check_feature_access(user_id, 'map_view'):
+        raise HTTPException(
+            status_code=403,
+            detail="Map view requires Premium subscription. Upgrade for location features!"
+        )
+    
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    query = """
+        SELECT cl.id, cl.title, cl.price, cl.location_lat, cl.location_lng, 
+               cl.url, ds.deal_score
+        FROM car_listings cl
+        JOIN car_searches cs ON cl.search_id = cs.id
+        LEFT JOIN deal_scores ds ON cl.id = ds.listing_id
+        WHERE cs.user_id = ? AND cl.location_lat IS NOT NULL AND cl.location_lng IS NOT NULL
+    """
+    
+    params = [user_id]
+    
+    if search_id:
+        query += " AND cs.id = ?"
+        params.append(search_id)
+    
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    
+    map_points = []
+    for row in rows:
+        map_points.append({
+            "id": row[0],
+            "title": row[1],
+            "price": row[2],
+            "latitude": row[3],
+            "longitude": row[4],
+            "url": row[5],
+            "deal_score": row[6]
+        })
+    
+    return {"map_points": map_points}
 
 @app.post("/car-searches", response_model=CarSearchResponse)
 async def create_car_search(search: CarSearchCreate, user_id: int = Depends(verify_token)):
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   # Get user's subscription tier
-   cursor.execute("SELECT subscription_tier FROM users WHERE id = ?", (user_id,))
-   user_result = cursor.fetchone()
-   if not user_result:
-       raise HTTPException(status_code=404, detail="User not found")
-   
-   subscription_tier = user_result[0]
-   
-   # Map yearly tiers to base tier for limit checks
-   base_tier = subscription_tier
-   if subscription_tier == 'pro_yearly':
-       base_tier = 'pro'
-   elif subscription_tier == 'premium_yearly':
-       base_tier = 'premium'
-   
-   max_searches = SUBSCRIPTION_LIMITS[base_tier]['max_searches']
-   
-   # Check current search count
-   cursor.execute("SELECT COUNT(*) FROM car_searches WHERE user_id = ? AND is_active = TRUE", (user_id,))
-   current_count = cursor.fetchone()[0]
-   
-   if current_count >= max_searches:
-       tier_display = {
-           "free": "Free (3 searches)", 
-           "pro": "Pro (15 searches)", 
-           "pro_yearly": "Pro Annual (15 searches)",
-           "premium": "Premium (25 searches)",
-           "premium_yearly": "Premium Annual (25 searches)"
-       }
-       raise HTTPException(
-           status_code=403, 
-           detail=f"Search limit reached! {tier_display[subscription_tier]} allows {max_searches} searches. Upgrade for more searches and advanced features!"
-       )
-   
-   # Create the search
-   cursor.execute(
-       """INSERT INTO car_searches 
-          (user_id, make, model, year_min, year_max, price_min, price_max, mileage_max, location) 
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-       (user_id, search.make, search.model, search.year_min, search.year_max, 
-        search.price_min, search.price_max, search.mileage_max, search.location)
-   )
-   
-   search_id = cursor.lastrowid
-   conn.commit()
-   
-   # Get the created search
-   cursor.execute("SELECT * FROM car_searches WHERE id = ?", (search_id,))
-   row = cursor.fetchone()
-   conn.close()
-   
-   # Update search suggestions
-   if search.make or search.model:
-       update_search_suggestions()
-   
-   return CarSearchResponse(
-       id=row[0],
-       make=row[2],
-       model=row[3],
-       year_min=row[4],
-       year_max=row[5],
-       price_min=row[6],
-       price_max=row[7],
-       mileage_max=row[8],
-       location=row[9],
-       is_active=row[10],
-       created_at=row[11]
-   )
-
-@app.get("/car-searches", response_model=List[CarSearchResponse])
-async def get_car_searches(user_id: int = Depends(verify_token)):
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   cursor.execute("SELECT * FROM car_searches WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
-   rows = cursor.fetchall()
-   conn.close()
-   
-   return [
-       CarSearchResponse(
-           id=row[0],
-           make=row[2],
-           model=row[3],
-           year_min=row[4],
-           year_max=row[5],
-           price_min=row[RetryJContinueEditpython           price_max=row[7],
-           mileage_max=row[8],
-           location=row[9],
-           is_active=row[10],
-           created_at=row[11]
-       ) for row in rows
-   ]
-
-@app.get("/car-searches/{search_id}/listings", response_model=List[CarListingResponse])
-async def get_car_listings(search_id: int, user_id: int = Depends(verify_token)):
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   # Verify ownership
-   cursor.execute("SELECT user_id FROM car_searches WHERE id = ?", (search_id,))
-   search = cursor.fetchone()
-   
-   if not search or search[0] != user_id:
-       raise HTTPException(status_code=404, detail="Search not found")
-   
-   cursor.execute(
-       "SELECT * FROM car_listings WHERE search_id = ? ORDER BY found_at DESC LIMIT 50",
-       (search_id,)
-   )
-   rows = cursor.fetchall()
-   conn.close()
-   
-   return [
-       CarListingResponse(
-           id=row[0],
-           title=row[2],
-           price=row[3],
-           year=row[4],
-           mileage=row[5],
-           url=row[6],
-           found_at=row[7]
-       ) for row in rows
-   ]
-
-@app.delete("/car-searches/{search_id}")
-async def delete_car_search(search_id: int, user_id: int = Depends(verify_token)):
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   # Verify ownership
-   cursor.execute("SELECT user_id FROM car_searches WHERE id = ?", (search_id,))
-   search = cursor.fetchone()
-   
-   if not search or search[0] != user_id:
-       raise HTTPException(status_code=404, detail="Search not found")
-   
-   cursor.execute("DELETE FROM car_searches WHERE id = ?", (search_id,))
-   conn.commit()
-   conn.close()
-   
-   return {"message": "Car search deleted successfully"}
-
-@app.get("/enhanced-pricing")
-async def get_enhanced_pricing():
-   """Enhanced pricing with new features highlighted"""
-   return {
-       "tiers": {
-           "free": {
-               "name": "Free",
-               "price": "$0/month",
-               "interval": "25 minutes",
-               "max_searches": 3,
-               "features": [
-                   "3 active car searches",
-                   "25-minute refresh rate",
-                   "Basic filtering",
-                   "Basic deal scoring",
-                   "Limited favorites"
-               ],
-               "limitations": [
-                   "No push notifications",
-                   "No price analytics", 
-                   "No advanced filters",
-                   "No car notes"
-               ]
-           },
-           "pro": {
-               "name": "Pro Monthly", 
-               "price": "$15/month",
-               "interval": "10 minutes",
-               "max_searches": 15,
-               "badge": "Most Popular",
-               "annual_option": {
-                   "price": "$153/year",
-                   "monthly_equivalent": "$12.75/month",
-                   "savings": "15% off"
-               },
-               "features": [
-                   "15 active car searches",
-                   "10-minute refresh rate",
-                   "🔔 Push notifications (NEW!)",
-                   "📊 Price analytics (NEW!)",
-                   "🔧 Advanced filtering (NEW!)",
-                   "📝 Car notes (NEW!)",
-                   "❤️ Unlimited favorites",
-                   "Priority support"
-               ]
-           },
-           "premium": {
-               "name": "Premium Monthly",
-               "price": "$50/month", 
-               "interval": "5 minutes",
-               "max_searches": 25,
-               "badge": "Best Value",
-               "annual_option": {
-                   "price": "$480/year",
-                   "monthly_equivalent": "$40/month", 
-                   "savings": "20% off"
-               },
-               "features": [
-                   "25 active car searches",
-                   "5-minute refresh rate (fastest!)",
-                   "🗺️ Map view (NEW!)",
-                   "🤖 AI deal insights (NEW!)",
-                   "📤 Export data (NEW!)",
-                   "👥 Social sharing (NEW!)",
-                   "All Pro features included",
-                   "VIP support"
-               ]
-           }
-       },
-       "new_features_highlight": {
-           "🔔 Smart Notifications": "Get instant alerts when great deals are found",
-           "📊 Market Analytics": "See price trends and deal quality scores",
-           "🤖 AI Deal Scoring": "Automatically identify the best deals",
-           "🗺️ Map View": "See all cars on an interactive map",
-           "📝 Car Notes": "Keep track of your thoughts on each listing"
-       },
-       "upgrade_benefits": [
-           "Find better deals faster with AI scoring",
-           "Never miss a great car with push notifications", 
-           "Make smarter decisions with price analytics",
-           "Save time with advanced filtering and notes"
-       ]
-   }
-
-@app.get("/stats")
-async def get_stats(user_id: int = Depends(verify_token)):
-   """Get enhanced user statistics"""
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   # Get total cars found for user
-   cursor.execute("""
-       SELECT COUNT(*) FROM car_listings cl
-       JOIN car_searches cs ON cl.search_id = cs.id
-       WHERE cs.user_id = ?
-   """, (user_id,))
-   total_cars = cursor.fetchone()[0]
-   
-   # Get cars found in last 24 hours
-   cursor.execute("""
-       SELECT COUNT(*) FROM car_listings cl
-       JOIN car_searches cs ON cl.search_id = cs.id
-       WHERE cs.user_id = ? AND cl.found_at > datetime('now', '-24 hours')
-   """, (user_id,))
-   cars_today = cursor.fetchone()[0]
-   
-   # Get subscription info
-   cursor.execute("SELECT subscription_tier FROM users WHERE id = ?", (user_id,))
-   tier = cursor.fetchone()[0]
-   
-   # Get excellent deals (score > 8.5)
-   cursor.execute("""
-       SELECT COUNT(*) FROM car_listings cl
-       JOIN car_searches cs ON cl.search_id = cs.id
-       WHERE cs.user_id = ? AND cl.deal_score > 8.5
-   """, (user_id,))
-   excellent_deals = cursor.fetchone()[0]
-   
-   # Get favorites count
-   cursor.execute("""
-       SELECT COUNT(*) FROM favorites f
-       JOIN car_listings cl ON f.listing_id = cl.id
-       JOIN car_searches cs ON cl.search_id = cs.id
-       WHERE cs.user_id = ?
-   """, (user_id,))
-   favorites_count = cursor.fetchone()[0]
-   
-   # Get average deal score
-   cursor.execute("""
-       SELECT AVG(cl.deal_score) FROM car_listings cl
-       JOIN car_searches cs ON cl.search_id = cs.id
-       WHERE cs.user_id = ? AND cl.deal_score IS NOT NULL
-   """, (user_id,))
-   avg_score_result = cursor.fetchone()
-   avg_deal_score = round(avg_score_result[0], 1) if avg_score_result[0] else None
-   
-   conn.close()
-   
-   return {
-       "total_cars_found": total_cars,
-       "cars_found_today": cars_today,
-       "excellent_deals": excellent_deals,
-       "favorites_count": favorites_count,
-       "average_deal_score": avg_deal_score,
-       "subscription_tier": tier,
-       "monitoring_interval": f"{SUBSCRIPTION_LIMITS.get(tier, {}).get('interval', 1500) // 60} minutes",
-       "insights": {
-           "deal_quality": (
-               "Excellent" if avg_deal_score and avg_deal_score > 7.5 else
-               "Good" if avg_deal_score and avg_deal_score > 6.0 else
-               "Average" if avg_deal_score else "No data yet"
-           ),
-           "hot_deals_percentage": round((excellent_deals / total_cars * 100), 1) if total_cars > 0 else 0
-       }
-   }
-
-@app.post("/stripe-webhook")
-async def stripe_webhook(request: Request):
-   """Handle Stripe webhooks for subscription events"""
-   payload = await request.body()
-   sig_header = request.headers.get('stripe-signature')
-   
-   try:
-       event = stripe.Webhook.construct_event(
-           payload, sig_header, STRIPE_WEBHOOK_SECRET
-       )
-   except ValueError:
-       raise HTTPException(status_code=400, detail="Invalid payload")
-   except stripe.error.SignatureVerificationError:
-       raise HTTPException(status_code=400, detail="Invalid signature")
-   
-   conn = sqlite3.connect(DATABASE)
-   cursor = conn.cursor()
-   
-   try:
-       if event['type'] == 'customer.subscription.updated':
-           subscription = event['data']['object']
-           customer_id = subscription['customer']
-           
-           # Find user by Stripe customer ID
-           cursor.execute("SELECT id FROM users WHERE stripe_customer_id = ?", (customer_id,))
-           user = cursor.fetchone()
-           
-           if user:
-               user_id = user[0]
-               
-               # Update subscription status based on Stripe
-               if subscription['status'] == 'active':
-                   # Determine tier from Stripe price
-                   price_id = subscription['items']['data'][0]['price']['id']
-                   tier_map = {
-                       "price_1RbtlsHH6XNAV6XKBbiwpO4K": "pro",
-                       "price_1RbtnZHH6XNAV6XKoCvZdKQX": "pro_yearly",
-                       "price_1Rbtp7HH6XNAV6XKQPe7ow42": "premium", 
-                       "price_1RbtpcHH6XNAV6XKlfmvTpke": "premium_yearly"
-                   }
-                   
-                   new_tier = tier_map.get(price_id, 'pro')
-                   
-                   cursor.execute("""
-                       UPDATE users 
-                       SET subscription_tier = ?, is_trial = FALSE, trial_ends = NULL,
-                           cancel_at_period_end = ?
-                       WHERE id = ?
-                   """, (new_tier, subscription.get('cancel_at_period_end', False), user_id))
-                   
-               elif subscription['status'] in ['canceled', 'unpaid']:
-                   # Downgrade to free
-                   cursor.execute("""
-                       UPDATE users 
-                       SET subscription_tier = 'free', is_trial = FALSE,
-                           trial_ends = NULL, stripe_subscription_id = NULL
-                       WHERE id = ?
-                   """, (user_id,))
-       
-       elif event['type'] == 'customer.subscription.deleted':
-           subscription = event['data']['object']
-           customer_id = subscription['customer']
-           
-           cursor.execute("SELECT id FROM users WHERE stripe_customer_id = ?", (customer_id,))
-           user = cursor.fetchone()
-           
-           if user:
-               # Downgrade to free when subscription is deleted
-               cursor.execute("""
-                   UPDATE users 
-                   SET subscription_tier = 'free', is_trial = FALSE,
-                       trial_ends = NULL, stripe_subscription_id = NULL
-                   WHERE id = ?
-               """, (user[0],))
-       
-       elif event['type'] == 'invoice.payment_failed':
-           invoice = event['data']['object']
-           customer_id = invoice['customer']
-           
-           cursor.execute("SELECT id, email FROM users WHERE stripe_customer_id = ?", (customer_id,))
-           user = cursor.fetchone()
-           
-           if user:
-               # You could send email notification about failed payment
-               print(f"Payment failed for user {user[1]} (ID: {user[0]})")
-       
-       conn.commit()
-       
-   except Exception as e:
-       print(f"Webhook error: {e}")
-       conn.rollback()
-   finally:
-       conn.close()
-   
-   return {"status": "success"}
-
-@app.get("/pricing")
-async def get_pricing():
-   return {
-       "tiers": {
-           "free": {
-               "name": "Free",
-               "price": "$0/month",
-               "interval": "25 minutes",
-               "max_searches": 3,
-               "features": [
-                   "3 active car searches",
-                   "25-minute refresh rate",
-                   "Basic email notifications",
-                   "Standard support"
-               ]
-           },
-           "pro": {
-               "name": "Pro Monthly", 
-               "price": "$15/month",
-               "interval": "10 minutes",
-               "max_searches": 15,
-               "annual_option": {
-                   "price": "$153/year",
-                   "monthly_equivalent": "$12.75/month",
-                   "savings": "15% off",
-                   "total_savings": "$27/year"
-               },
-               "features": [
-                   "15 active car searches",
-                   "10-minute refresh rate", 
-                   "Email & push notifications",
-                   "Advanced filters",
-                   "Priority support",
-                   "Multiple locations"
-               ]
-           },
-           "premium": {
-               "name": "Premium Monthly",
-               "price": "$50/month", 
-               "interval": "5 minutes",
-               "max_searches": 25,
-               "annual_option": {
-                   "price": "$480/year",
-                   "monthly_equivalent": "$40/month",
-                   "savings": "20% off",
-                   "total_savings": "$120/year"
-               },
-               "features": [
-                   "25 active car searches",
-                   "5-minute refresh rate",
-                   "Instant notifications",
-                   "All advanced features",
-                   "VIP support",
-                   "Unlimited locations",
-                   "Custom alerts"
-               ]
-           }
-       },
-       "comparison": {
-           "swoopa_pricing": "$300-600/month",
-           "our_monthly_savings": "92-95% cheaper than Swoopa",
-           "our_annual_savings": "Even better with annual plans!",
-           "value_proposition": "Professional car flipping tools at fraction of the cost"
-       },
-       "annual_benefits": [
-           "Lock in current pricing",
-           "Significant cost savings",
-           "No monthly billing hassle",
-           "Priority customer support"
-       ]
-   }
-
-@app.get("/health")
-async def health_check():
-   return {
-       "status": "healthy", 
-       "timestamp": datetime.utcnow(),
-       "service": "Enhanced Flippit Car Monitor",
-       "version": "3.0.0",
-       "features": [
-           "AI Deal Scoring",
-           "Push Notifications", 
-           "Price Analytics",
-           "Advanced Filtering",
-           "Map View",
-           "Social Features"
-       ]
-   }
-
-if __name__ == "__main__":
-   import uvicorn
-   port = int(os.getenv("PORT", 8000))
-   print("🚀 Starting Enhanced Flippit API Server v3.0.0")
-   print("✨ New Features: AI Deal Scoring, Push Notifications, Price Analytics")
-   uvicorn.run(app, host="0.0.0.0", port=port)
-   location=row[9],
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Get user's subscription tier
+    cursor.execute("SELECT subscription_tier FROM users WHERE id = ?", (user_id,))
+    user_result = cursor.fetchone()
+    if not user_result:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    subscription_tier = user_result[0]
+    
+    # Map yearly tiers to base tier for limit checks
+    base_tier = subscription_tier
+    if subscription_tier == 'pro_yearly':
+        base_tier = 'pro'
+    elif subscription_tier == 'premium_yearly':
+        base_tier = 'premium'
+    
+    max_searches = SUBSCRIPTION_LIMITS[base_tier]['max_searches']
+    
+    # Check current search count
+    cursor.execute("SELECT COUNT(*) FROM car_searches WHERE user_id = ? AND is_active = TRUE", (user_id,))
+    current_count = cursor.fetchone()[0]
+    
+    if current_count >= max_searches:
+        tier_display = {
+            "free": "Free (3 searches)", 
+            "pro": "Pro (15 searches)", 
+            "pro_yearly": "Pro Annual (15 searches)",
+            "premium": "Premium (25 searches)",
+            "premium_yearly": "Premium Annual (25 searches)"
+        }
+        raise HTTPException(
+            status_code=403, 
+            detail=f"Search limit reached! {tier_display[subscription_tier]} allows {max_searches} searches. Upgrade for more searches and advanced features!"
+        )
+    
+    # Create the search
+    cursor.execute(
+        """INSERT INTO car_searches 
+           (user_id, make, model, year_min, year_max, price_min, price_max, mileage_max, location) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (user_id, search.make, search.model, search.year_min, search.year_max, 
+         search.price_min, search.price_max, search.mileage_max, search.location)
+    )
+    
+    search_id = cursor.lastrowid
+    conn.commit()
+    
+    # Get the created search
+    cursor.execute("SELECT * FROM car_searches WHERE id = ?", (search_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    # Update search suggestions
+    if search.make or search.model:
+        update_search_suggestions()
+    
+    return CarSearchResponse(
+        id=row[0],
+        make=row[2],
+        model=row[3],
+        year_min=row[4],
+        year_max=row[5],
+        price_min=row[6],
+        price_max=row[7],
+        mileage_max=row[8],
+        location=row[9],
         is_active=row[10],
         created_at=row[11]
     )
