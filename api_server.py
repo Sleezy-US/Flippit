@@ -2126,3 +2126,97 @@ if __name__ == "__main__":
    print("🚀 Starting Enhanced Flippit API Server v3.0.0")
    print("✨ New Features: AI Deal Scoring, Push Notifications, Price Analytics")
    uvicorn.run(app, host="0.0.0.0", port=port)
+   location=row[9],
+        is_active=row[10],
+        created_at=row[11]
+    )
+
+@app.get("/car-searches", response_model=List[CarSearchResponse])
+async def get_car_searches(user_id: int = Depends(verify_token)):
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM car_searches WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    return [
+        CarSearchResponse(
+            id=row[0],
+            make=row[2],
+            model=row[3],
+            year_min=row[4],
+            year_max=row[5],
+            price_min=row[6],
+            price_max=row[7],
+            mileage_max=row[8],
+            location=row[9],
+            is_active=row[10],
+            created_at=row[11]
+        ) for row in rows
+    ]
+
+@app.get("/car-searches/{search_id}/listings", response_model=List[CarListingResponse])
+async def get_car_listings(search_id: int, user_id: int = Depends(verify_token)):
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Verify ownership
+    cursor.execute("SELECT user_id FROM car_searches WHERE id = ?", (search_id,))
+    search = cursor.fetchone()
+    
+    if not search or search[0] != user_id:
+        raise HTTPException(status_code=404, detail="Search not found")
+    
+    cursor.execute(
+        "SELECT * FROM car_listings WHERE search_id = ? ORDER BY found_at DESC LIMIT 50",
+        (search_id,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    
+    return [
+        CarListingResponse(
+            id=row[0],
+            title=row[2],
+            price=row[3],
+            year=row[4],
+            mileage=row[5],
+            url=row[6],
+            found_at=row[7]
+        ) for row in rows
+    ]
+
+@app.delete("/car-searches/{search_id}")
+async def delete_car_search(search_id: int, user_id: int = Depends(verify_token)):
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Verify ownership
+    cursor.execute("SELECT user_id FROM car_searches WHERE id = ?", (search_id,))
+    search = cursor.fetchone()
+    
+    if not search or search[0] != user_id:
+        raise HTTPException(status_code=404, detail="Search not found")
+    
+    cursor.execute("DELETE FROM car_searches WHERE id = ?", (search_id,))
+    conn.commit()
+    conn.close()
+    
+    return {"message": "Car search deleted successfully"}
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy", 
+        "timestamp": datetime.utcnow(),
+        "service": "Enhanced Flippit Car Monitor",
+        "version": "3.0.0"
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    print("🚀 Starting Enhanced Flippit API Server v3.0.0")
+    print("✨ New Features: AI Deal Scoring, Push Notifications, Price Analytics")
+    uvicorn.run(app, host="0.0.0.0", port=port)
