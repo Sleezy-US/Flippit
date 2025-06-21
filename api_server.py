@@ -1,4 +1,4 @@
-import stripe
+import requests
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,7 +7,7 @@ from typing import List, Optional, Dict, Any
 import asyncio
 import sqlite3
 import hashlib
-from jose import jwt
+from jose import jwt, JWTError
 from datetime import datetime, timedelta, timezone
 import os
 import threading
@@ -16,6 +16,8 @@ import json
 import statistics
 import requests
 import random
+import base64
+import hmac
 
 # Import our car scraper
 from fb_scraper import CarSearchMonitor
@@ -38,9 +40,10 @@ value_estimator = KBBValueEstimator()
 USE_MOCK_DATA = os.getenv("USE_MOCK_DATA", "true").lower() == "true"
 USE_SELENIUM = os.getenv("USE_SELENIUM", "false").lower() == "true"
 
-# Stripe configuration
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "sk_test_your_stripe_key_here")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "whsec_your_webhook_secret")
+# iOS In-App Purchase Configuration
+APPLE_SHARED_SECRET = os.getenv("APPLE_SHARED_SECRET", "your_apple_shared_secret")
+APPLE_SANDBOX_URL = "https://sandbox.itunes.apple.com/verifyReceipt"
+APPLE_PRODUCTION_URL = "https://buy.itunes.apple.com/verifyReceipt"
 
 app = FastAPI(title="Flippit - Enhanced Car Marketplace Monitor API", version="3.2.0")
 
@@ -53,9 +56,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Security
+# Security with more robust secret key handling
 security = HTTPBearer()
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this")
+SECRET_KEY = os.getenv("SECRET_KEY", "flippit-default-secret-key-change-this-in-production")
+
+# Print secret key info for debugging (remove in production)
+print(f"🔑 Using SECRET_KEY: {SECRET_KEY[:10]}... (length: {len(SECRET_KEY)})")
 
 # Database
 DATABASE = "car_marketplace.db"
@@ -74,6 +80,38 @@ DEFAULT_MIN_YEAR = CURRENT_YEAR - 20  # Default to last 20 years
 DEFAULT_MAX_YEAR = CURRENT_YEAR + 1  # Allow for next year's models
 DEFAULT_MIN_PRICE = 500
 DEFAULT_MAX_PRICE = 100000
+
+# iOS In-App Purchase Product IDs and Pricing
+IAP_PRODUCTS = {
+    'com.flippit.pro.monthly': {
+        'tier': 'pro',
+        'duration': 'monthly',
+        'price': 14.99,
+        'display_price': '$14.99/month'
+    },
+    'com.flippit.pro.yearly': {
+        'tier': 'pro_yearly',
+        'duration': 'yearly',
+        'price': 152.99,  # 15% off ($179.88 - $26.89 = $152.99)
+        'display_price': '$152.99/year (15% off)',
+        'original_price': 179.88,
+        'savings': 26.89
+    },
+    'com.flippit.premium.monthly': {
+        'tier': 'premium',
+        'duration': 'monthly',
+        'price': 49.99,
+        'display_price': '$49.99/month'
+    },
+    'com.flippit.premium.yearly': {
+        'tier': 'premium_yearly',
+        'duration': 'yearly',
+        'price': 479.99,  # 20% off ($599.88 - $119.89 = $479.99)
+        'display_price': '$479.99/year (20% off)',
+        'original_price': 599.88,
+        'savings': 119.89
+    }
+}
 
 # Enhanced Subscription Configuration with Distance Limits
 SUBSCRIPTION_LIMITS = {
@@ -194,12 +232,30 @@ def init_db():
             subscription_expires TIMESTAMP,
             trial_ends TIMESTAMP,
             is_trial BOOLEAN DEFAULT FALSE,
-            stripe_customer_id TEXT,
-            stripe_subscription_id TEXT,
-            stripe_payment_method_id TEXT,
+            apple_receipt_data TEXT,
+            apple_original_transaction_id TEXT,
+            apple_latest_transaction_id TEXT,
+            apple_subscription_id TEXT,
             cancel_at_period_end BOOLEAN DEFAULT FALSE,
             gifted_by TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # iOS In-App Purchase receipts table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS apple_receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            receipt_data TEXT NOT NULL,
+            transaction_id TEXT UNIQUE NOT NULL,
+            original_transaction_id TEXT,
+            product_id TEXT NOT NULL,
+            purchase_date TIMESTAMP,
+            expires_date TIMESTAMP,
+            is_active BOOLEAN DEFAULT TRUE,
+            verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
     
@@ -342,19 +398,22 @@ def init_db():
         )
     ''')
     
-    # Add distance_miles column to existing car_searches table if it doesn't exist
-    try:
-        cursor.execute("ALTER TABLE car_searches ADD COLUMN distance_miles INTEGER DEFAULT 25")
-        print("✅ Added distance_miles column to car_searches table")
-    except sqlite3.OperationalError:
-        pass
+    # Add new columns if they don't exist
+    columns_to_add = [
+        ("car_searches", "distance_miles", "INTEGER DEFAULT 25"),
+        ("car_listings", "deal_score", "REAL"),
+        ("users", "apple_receipt_data", "TEXT"),
+        ("users", "apple_original_transaction_id", "TEXT"),
+        ("users", "apple_latest_transaction_id", "TEXT"),
+        ("users", "apple_subscription_id", "TEXT")
+    ]
     
-    # Add deal_score column to existing car_listings table if it doesn't exist
-    try:
-        cursor.execute("ALTER TABLE car_listings ADD COLUMN deal_score REAL")
-        print("✅ Added deal_score column to car_listings table")
-    except sqlite3.OperationalError:
-        pass
+    for table, column, definition in columns_to_add:
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            print(f"✅ Added {column} column to {table} table")
+        except sqlite3.OperationalError:
+            pass
     
     conn.commit()
     conn.close()
@@ -415,6 +474,80 @@ class SubscriptionResponse(BaseModel):
     trial_ends: Optional[str] = None
     gifted_by: Optional[str] = None
 
+class AppleReceiptVerification(BaseModel):
+    receipt_data: str
+    product_id: str
+
+# Apple IAP Helper Functions
+async def verify_apple_receipt(receipt_data: str, use_sandbox: bool = True) -> Dict:
+    """
+    Verify Apple receipt with App Store
+    """
+    url = APPLE_SANDBOX_URL if use_sandbox else APPLE_PRODUCTION_URL
+    
+    payload = {
+        'receipt-data': receipt_data,
+        'password': APPLE_SHARED_SECRET,
+        'exclude-old-transactions': True
+    }
+    
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        result = response.json()
+        
+        # If sandbox fails and we get status 21007, try production
+        if result.get('status') == 21007 and use_sandbox:
+            return await verify_apple_receipt(receipt_data, use_sandbox=False)
+        
+        return result
+    except Exception as e:
+        print(f"Apple receipt verification failed: {e}")
+        return {'status': 99999, 'error': str(e)}
+
+def parse_apple_receipt(receipt_data: Dict) -> Optional[Dict]:
+    """
+    Parse Apple receipt data to extract subscription info
+    """
+    try:
+        receipt = receipt_data.get('receipt', {})
+        latest_receipt_info = receipt_data.get('latest_receipt_info', [])
+        
+        if not latest_receipt_info:
+            return None
+        
+        # Get the most recent transaction
+        latest_transaction = max(latest_receipt_info,
+                               key=lambda x: x.get('purchase_date_ms', '0'))
+        
+        expires_date_ms = latest_transaction.get('expires_date_ms')
+        expires_date = None
+        if expires_date_ms:
+            expires_date = datetime.fromtimestamp(int(expires_date_ms) / 1000)
+        
+        purchase_date_ms = latest_transaction.get('purchase_date_ms')
+        purchase_date = None
+        if purchase_date_ms:
+            purchase_date = datetime.fromtimestamp(int(purchase_date_ms) / 1000)
+        
+        return {
+            'product_id': latest_transaction.get('product_id'),
+            'transaction_id': latest_transaction.get('transaction_id'),
+            'original_transaction_id': latest_transaction.get('original_transaction_id'),
+            'purchase_date': purchase_date,
+            'expires_date': expires_date,
+            'is_active': expires_date > datetime.now() if expires_date else False
+        }
+    except Exception as e:
+        print(f"Error parsing Apple receipt: {e}")
+        return None
+
+def get_subscription_tier_from_product_id(product_id: str) -> str:
+    """
+    Map Apple product ID to subscription tier
+    """
+    product_info = IAP_PRODUCTS.get(product_id)
+    return product_info['tier'] if product_info else 'free'
+
 # Helper functions
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
@@ -427,15 +560,21 @@ def create_token(user_id: int) -> str:
         "user_id": user_id,
         "exp": datetime.now(timezone.utc) + timedelta(days=7)
     }
-    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+    token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+    print(f"🔑 Created token for user {user_id} with secret: {SECRET_KEY[:10]}...")
+    return token
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
+        print(f"🔍 Verifying token with secret: {SECRET_KEY[:10]}...")
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=["HS256"])
+        print(f"✅ Token verified successfully for user: {payload['user_id']}")
         return payload["user_id"]
     except jwt.ExpiredSignatureError:
+        print("❌ Token expired")
         raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.JWTError:
+    except JWTError as e:
+        print(f"❌ Token verification failed: {e}")
         raise HTTPException(status_code=401, detail="Invalid token")
 
 def get_user_subscription_tier(user_id: int) -> str:
@@ -784,14 +923,25 @@ async def root():
     return {
         "message": "🚗 Flippit - Enhanced Car Marketplace Monitor",
         "version": "3.2.0",
-        "features": "Distance-based search limits, KBB-style values, AI deal scoring",
+        "features": "iOS In-App Purchase, Distance-based search limits, KBB-style values, AI deal scoring",
         "docs": "/docs"
+    }
+
+@app.get("/debug-auth")
+async def debug_auth():
+    """Debug endpoint to check auth configuration"""
+    return {
+        "secret_key_length": len(SECRET_KEY),
+        "secret_key_preview": SECRET_KEY[:10] + "...",
+        "message": "Check if this secret key matches between login and verification"
     }
 
 @app.get("/pricing")
 async def get_pricing():
-    """Get subscription pricing information"""
+    """Get iOS subscription pricing information"""
     return {
+        "platform": "ios",
+        "products": IAP_PRODUCTS,
         "tiers": {
             "free": {
                 "name": "Free",
@@ -808,8 +958,9 @@ async def get_pricing():
             },
             "pro": {
                 "name": "Pro",
-                "monthly_price": "$15/month",
-                "yearly_price": "$153/year (15% off)",
+                "monthly_price": "$14.99/month",
+                "yearly_price": "$152.99/year (15% off)",
+                "yearly_savings": "$26.89",
                 "searches": 15,
                 "refresh_minutes": 10,
                 "search_radius": "50 miles",
@@ -825,8 +976,9 @@ async def get_pricing():
             },
             "premium": {
                 "name": "Premium",
-                "monthly_price": "$50/month",
-                "yearly_price": "$480/year (20% off)",
+                "monthly_price": "$49.99/month",
+                "yearly_price": "$479.99/year (20% off)",
+                "yearly_savings": "$119.89",
                 "searches": 25,
                 "refresh_minutes": 5,
                 "search_radius": "200 miles",
@@ -894,6 +1046,176 @@ async def login(user: UserLogin):
         "subscription_tier": subscription_tier
     }
 
+@app.post("/verify-purchase")
+async def verify_purchase(receipt: AppleReceiptVerification, user_id: int = Depends(verify_token)):
+    """
+    Verify iOS In-App Purchase and activate subscription
+    """
+    try:
+        # Verify receipt with Apple
+        verification_result = await verify_apple_receipt(receipt.receipt_data)
+        
+        if verification_result.get('status') != 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Receipt verification failed: {verification_result.get('status')}"
+            )
+        
+        # Parse receipt data
+        purchase_info = parse_apple_receipt(verification_result)
+        
+        if not purchase_info:
+            raise HTTPException(status_code=400, detail="Invalid receipt data")
+        
+        # Verify product ID matches
+        if purchase_info['product_id'] != receipt.product_id:
+            raise HTTPException(status_code=400, detail="Product ID mismatch")
+        
+        # Check if purchase is active
+        if not purchase_info['is_active']:
+            raise HTTPException(status_code=400, detail="Subscription has expired")
+        
+        # Get subscription tier from product ID
+        subscription_tier = get_subscription_tier_from_product_id(receipt.product_id)
+        
+        # Update user subscription
+        conn = sqlite3.connect(DATABASE)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            UPDATE users SET 
+                subscription_tier = ?,
+                subscription_expires = ?,
+                apple_receipt_data = ?,
+                apple_original_transaction_id = ?,
+                apple_latest_transaction_id = ?,
+                apple_subscription_id = ?
+            WHERE id = ?
+        """, (
+            subscription_tier,
+            purchase_info['expires_date'],
+            receipt.receipt_data,
+            purchase_info['original_transaction_id'],
+            purchase_info['transaction_id'],
+            receipt.product_id,
+            user_id
+        ))
+        
+        # Save receipt record
+        cursor.execute("""
+            INSERT OR REPLACE INTO apple_receipts 
+            (user_id, receipt_data, transaction_id, original_transaction_id, 
+             product_id, purchase_date, expires_date, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            receipt.receipt_data,
+            purchase_info['transaction_id'],
+            purchase_info['original_transaction_id'],
+            receipt.product_id,
+            purchase_info['purchase_date'],
+            purchase_info['expires_date'],
+            purchase_info['is_active']
+        ))
+        
+        conn.commit()
+        conn.close()
+        
+        product_info = IAP_PRODUCTS.get(receipt.product_id, {})
+        
+        return {
+            "success": True,
+            "subscription_tier": subscription_tier,
+            "expires_date": purchase_info['expires_date'].isoformat() if purchase_info['expires_date'] else None,
+            "product_info": product_info,
+            "message": f"Successfully activated {product_info.get('display_price', 'subscription')}!"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Purchase verification error: {e}")
+        raise HTTPException(status_code=500, detail="Purchase verification failed")
+
+@app.post("/restore-purchases")
+async def restore_purchases(receipt: AppleReceiptVerification, user_id: int = Depends(verify_token)):
+    """
+    Restore previous iOS purchases
+    """
+    try:
+        # Verify receipt with Apple
+        verification_result = await verify_apple_receipt(receipt.receipt_data)
+        
+        if verification_result.get('status') != 0:
+            raise HTTPException(status_code=400, detail="Receipt verification failed")
+        
+        # Get all transactions from receipt
+        latest_receipt_info = verification_result.get('latest_receipt_info', [])
+        
+        if not latest_receipt_info:
+            return {"restored": False, "message": "No purchases found to restore"}
+        
+        # Find the most recent active subscription
+        active_subscription = None
+        for transaction in latest_receipt_info:
+            expires_date_ms = transaction.get('expires_date_ms')
+            if expires_date_ms:
+                expires_date = datetime.fromtimestamp(int(expires_date_ms) / 1000)
+                if expires_date > datetime.now():
+                    if not active_subscription or expires_date > active_subscription['expires_date']:
+                        active_subscription = {
+                            'product_id': transaction.get('product_id'),
+                            'transaction_id': transaction.get('transaction_id'),
+                            'original_transaction_id': transaction.get('original_transaction_id'),
+                            'expires_date': expires_date,
+                            'purchase_date': datetime.fromtimestamp(int(transaction.get('purchase_date_ms', 0)) / 1000)
+                        }
+        
+        if not active_subscription:
+            return {"restored": False, "message": "No active subscriptions found"}
+        
+        # Restore the subscription
+        subscription_tier = get_subscription_tier_from_product_id(active_subscription['product_id'])
+        
+        conn = sqlite3.connect(DATABASE)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            UPDATE users SET 
+                subscription_tier = ?,
+                subscription_expires = ?,
+                apple_receipt_data = ?,
+                apple_original_transaction_id = ?,
+                apple_latest_transaction_id = ?,
+                apple_subscription_id = ?
+            WHERE id = ?
+        """, (
+            subscription_tier,
+            active_subscription['expires_date'],
+            receipt.receipt_data,
+            active_subscription['original_transaction_id'],
+            active_subscription['transaction_id'],
+            active_subscription['product_id'],
+            user_id
+        ))
+        
+        conn.commit()
+        conn.close()
+        
+        product_info = IAP_PRODUCTS.get(active_subscription['product_id'], {})
+        
+        return {
+            "restored": True,
+            "subscription_tier": subscription_tier,
+            "expires_date": active_subscription['expires_date'].isoformat(),
+            "product_info": product_info,
+            "message": f"Successfully restored {product_info.get('display_price', 'subscription')}!"
+        }
+        
+    except Exception as e:
+        print(f"Restore purchases error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to restore purchases")
+
 @app.get("/subscription")
 async def get_subscription(request: Request):
     """Get subscription info with better error handling"""
@@ -912,7 +1234,8 @@ async def get_subscription(request: Request):
                 "features": ["basic_search", "value_estimates", "25_mile_radius"],
                 "price": "$0/month",
                 "trial_ends": None,
-                "gifted_by": None
+                "gifted_by": None,
+                "platform": "ios"
             }
         
         # Try to verify the token
@@ -932,7 +1255,8 @@ async def get_subscription(request: Request):
                 "features": ["basic_search", "value_estimates", "25_mile_radius"],
                 "price": "$0/month",
                 "trial_ends": None,
-                "gifted_by": None
+                "gifted_by": None,
+                "platform": "ios"
             }
         
         # Get user's actual subscription
@@ -940,7 +1264,7 @@ async def get_subscription(request: Request):
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT subscription_tier, trial_ends, gifted_by 
+            SELECT subscription_tier, subscription_expires, trial_ends, gifted_by 
             FROM users WHERE id = ?
         """, (user_id,))
         result = cursor.fetchone()
@@ -957,10 +1281,21 @@ async def get_subscription(request: Request):
                 "features": ["basic_search", "value_estimates", "25_mile_radius"],
                 "price": "$0/month",
                 "trial_ends": None,
-                "gifted_by": None
+                "gifted_by": None,
+                "platform": "ios"
             }
         
-        tier, trial_ends, gifted_by = result
+        tier, subscription_expires, trial_ends, gifted_by = result
+        
+        # Check if subscription has expired
+        if subscription_expires:
+            expires_date = datetime.fromisoformat(subscription_expires.replace('Z', '+00:00'))
+            if expires_date < datetime.now(timezone.utc):
+                # Subscription expired, downgrade to free
+                cursor.execute("UPDATE users SET subscription_tier = 'free' WHERE id = ?", (user_id,))
+                conn.commit()
+                tier = 'free'
+        
         limits = get_subscription_limits(tier)
         
         # Count current searches
@@ -969,12 +1304,13 @@ async def get_subscription(request: Request):
         
         conn.close()
         
-        pricing = {
+        # Get display price for current tier
+        display_prices = {
             "free": "$0/month",
-            "pro": "$15/month",
-            "pro_yearly": "$153/year",
-            "premium": "$50/month",
-            "premium_yearly": "$480/year"
+            "pro": "$14.99/month",
+            "pro_yearly": "$152.99/year (15% off)",
+            "premium": "$49.99/month",
+            "premium_yearly": "$479.99/year (20% off)"
         }
         
         return {
@@ -984,9 +1320,11 @@ async def get_subscription(request: Request):
             "interval_minutes": limits['interval'] // 60,
             "max_distance_miles": limits['max_distance_miles'],
             "features": limits['features'],
-            "price": pricing.get(tier, "$0/month"),
+            "price": display_prices.get(tier, "$0/month"),
             "trial_ends": trial_ends,
-            "gifted_by": gifted_by
+            "gifted_by": gifted_by,
+            "platform": "ios",
+            "expires_date": subscription_expires
         }
         
     except Exception as e:
@@ -1001,32 +1339,9 @@ async def get_subscription(request: Request):
             "features": ["basic_search", "value_estimates", "25_mile_radius"],
             "price": "$0/month",
             "trial_ends": None,
-            "gifted_by": None
+            "gifted_by": None,
+            "platform": "ios"
         }
-
-@app.get("/subscription-debug")
-async def debug_subscription(request: Request):
-    """Debug subscription issues"""
-    auth_header = request.headers.get("authorization")
-    
-    debug_info = {
-        "has_auth_header": bool(auth_header),
-        "auth_header_preview": auth_header[:20] + "..." if auth_header else None,
-        "user_agent": request.headers.get("user-agent"),
-        "endpoint_exists": True
-    }
-    
-    if auth_header:
-        try:
-            token = auth_header.replace("Bearer ", "")
-            payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-            debug_info["token_valid"] = True
-            debug_info["user_id"] = payload.get("user_id")
-        except Exception as e:
-            debug_info["token_valid"] = False
-            debug_info["token_error"] = str(e)
-    
-    return debug_info
 
 @app.post("/car-searches", response_model=CarSearchResponse)
 async def create_car_search(search: CarSearchCreate, user_id: int = Depends(verify_token)):
@@ -1195,7 +1510,6 @@ async def get_all_deals(user_id: int = Depends(verify_token)):
     cursor = conn.cursor()
     
     try:
-        # Simpler query to avoid column mismatches
         cursor.execute("""
             SELECT 
                 cl.id, cl.search_id, cl.title, cl.price, cl.year, cl.mileage,
@@ -1298,11 +1612,13 @@ async def test_car_search(search_id: int, user_id: int = Depends(verify_token)):
 async def get_config():
     """Get current configuration"""
     return {
+        "platform": "ios",
         "use_mock_data": USE_MOCK_DATA,
         "use_selenium": USE_SELENIUM,
         "enhanced_scraper": ENHANCED_SCRAPER_AVAILABLE,
         "version": "3.2.0",
         "features": {
+            "ios_iap": True,
             "distance_limits": True,
             "kbb_values": True,
             "deal_scoring": True,
@@ -1314,13 +1630,15 @@ async def get_config():
             "default_min": DEFAULT_MIN_YEAR,
             "default_max": DEFAULT_MAX_YEAR,
             "current_year": CURRENT_YEAR
+        },
+        "iap_products": IAP_PRODUCTS,
+        "secret_key_info": {
+            "length": len(SECRET_KEY),
+            "preview": SECRET_KEY[:10] + "..."
         }
     }
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    print("🚀 Starting Enhanced Flippit API Server v3.2.0")
-    print("✨ New Features: Distance-based search limits by tier")
-    print(f"📍 Free: 25 miles | Pro: 50 miles | Premium: 200 miles")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    print("🍎 Starting Enhanced Flippit API Server v3.2.0 with iOS
