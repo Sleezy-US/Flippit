@@ -1354,6 +1354,9 @@ async def get_subscription(request: Request):
 
 @app.post("/car-searches", response_model=CarSearchResponse)
 async def create_car_search(search: CarSearchCreate, user_id: int = Depends(verify_token)):
+    print(f"🎯 Creating new search for user {user_id}")
+    print(f"   Search details: {search.dict()}")
+    
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
     
@@ -1361,11 +1364,16 @@ async def create_car_search(search: CarSearchCreate, user_id: int = Depends(veri
     tier = get_user_subscription_tier(user_id)
     limits = get_subscription_limits(tier)
     
+    print(f"   User tier: {tier}, Max searches: {limits['max_searches']}")
+    
     # Check search count
     cursor.execute("SELECT COUNT(*) FROM car_searches WHERE user_id = ? AND is_active = TRUE", (user_id,))
     current_count = cursor.fetchone()[0]
     
+    print(f"   Current search count: {current_count}")
+    
     if current_count >= limits['max_searches']:
+        print(f"❌ Search limit reached for user {user_id}")
         raise HTTPException(
             status_code=403,
             detail=f"Search limit reached! {tier} tier allows {limits['max_searches']} searches."
@@ -1374,6 +1382,7 @@ async def create_car_search(search: CarSearchCreate, user_id: int = Depends(veri
     # Set distance based on subscription or use provided value if within limits
     if search.distance_miles:
         if search.distance_miles > limits['max_distance_miles']:
+            print(f"❌ Distance limit exceeded: {search.distance_miles} > {limits['max_distance_miles']}")
             raise HTTPException(
                 status_code=403,
                 detail=f"{tier} tier allows searches up to {limits['max_distance_miles']} miles. Upgrade for wider search!"
@@ -1381,6 +1390,8 @@ async def create_car_search(search: CarSearchCreate, user_id: int = Depends(veri
         distance = search.distance_miles
     else:
         distance = limits['max_distance_miles']
+    
+    print(f"   Using distance: {distance} miles")
     
     # Validate year ranges
     if search.year_min and search.year_min < MIN_CAR_YEAR:
@@ -1401,15 +1412,20 @@ async def create_car_search(search: CarSearchCreate, user_id: int = Depends(veri
     search_id = cursor.lastrowid
     conn.commit()
     
+    print(f"✅ Created search with ID: {search_id}")
+    
     # Get the created search
     cursor.execute("SELECT * FROM car_searches WHERE id = ?", (search_id,))
     row = cursor.fetchone()
+    
+    print(f"   Retrieved search: {row}")
+    
     conn.close()
     
     if search.make or search.model:
         update_search_suggestions()
     
-    return CarSearchResponse(
+    result = CarSearchResponse(
         id=row[0],
         make=row[2],
         model=row[3],
@@ -1423,32 +1439,123 @@ async def create_car_search(search: CarSearchCreate, user_id: int = Depends(veri
         is_active=row[11],
         created_at=row[12]
     )
+    
+    print(f"🎉 Returning search: {result.dict()}")
+    return result
+
+@app.get("/debug-searches")
+async def debug_searches(request: Request):
+    """Debug endpoint to check all searches and user info"""
+    try:
+        # Try to get user from token
+        auth_header = request.headers.get("authorization")
+        user_id = None
+        
+        if auth_header:
+            try:
+                token = auth_header.replace("Bearer ", "")
+                payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+                user_id = payload["user_id"]
+            except Exception as e:
+                print(f"Token error in debug: {e}")
+        
+        conn = sqlite3.connect(DATABASE)
+        cursor = conn.cursor()
+        
+        # Get all users
+        cursor.execute("SELECT id, email, subscription_tier FROM users")
+        all_users = cursor.fetchall()
+        
+        # Get all searches
+        cursor.execute("""
+            SELECT cs.id, cs.user_id, cs.make, cs.model, cs.is_active, cs.created_at, u.email
+            FROM car_searches cs
+            LEFT JOIN users u ON cs.user_id = u.id
+            ORDER BY cs.created_at DESC
+        """)
+        all_searches = cursor.fetchall()
+        
+        # Get searches for current user if authenticated
+        user_searches = []
+        if user_id:
+            cursor.execute("""
+                SELECT * FROM car_searches 
+                WHERE user_id = ? 
+                ORDER BY created_at DESC
+            """, (user_id,))
+            user_searches = cursor.fetchall()
+        
+        conn.close()
+        
+        return {
+            "authenticated_user_id": user_id,
+            "total_users": len(all_users),
+            "total_searches": len(all_searches),
+            "current_user_searches": len(user_searches),
+            "users": [{"id": u[0], "email": u[1], "tier": u[2]} for u in all_users],
+            "all_searches": [
+                {
+                    "id": s[0],
+                    "user_id": s[1],
+                    "make": s[2],
+                    "model": s[3],
+                    "is_active": s[4],
+                    "created_at": s[5],
+                    "user_email": s[6]
+                } for s in all_searches
+            ],
+            "current_user_searches_detail": [
+                {
+                    "id": s[0],
+                    "make": s[2],
+                    "model": s[3],
+                    "is_active": s[11] if len(s) > 11 else "unknown"
+                } for s in user_searches
+            ]
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.get("/car-searches", response_model=List[CarSearchResponse])
 async def get_car_searches(user_id: int = Depends(verify_token)):
+    print(f"🔍 Getting car searches for user {user_id}")
+    
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
     
     cursor.execute("SELECT * FROM car_searches WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
     rows = cursor.fetchall()
+    
+    print(f"📊 Found {len(rows)} searches for user {user_id}")
+    for i, row in enumerate(rows):
+        print(f"   Search {i+1}: ID={row[0]}, Make={row[2]}, Model={row[3]}, Active={row[11] if len(row) > 11 else 'unknown'}")
+    
     conn.close()
     
-    return [
-        CarSearchResponse(
-            id=row[0],
-            make=row[2],
-            model=row[3],
-            year_min=row[4],
-            year_max=row[5],
-            price_min=row[6],
-            price_max=row[7],
-            mileage_max=row[8],
-            location=row[9],
-            distance_miles=row[10] if len(row) > 10 else 25,
-            is_active=row[11] if len(row) > 11 else True,
-            created_at=row[12] if len(row) > 12 else ""
-        ) for row in rows
-    ]
+    searches = []
+    for row in rows:
+        try:
+            search = CarSearchResponse(
+                id=row[0],
+                make=row[2],
+                model=row[3],
+                year_min=row[4],
+                year_max=row[5],
+                price_min=row[6],
+                price_max=row[7],
+                mileage_max=row[8],
+                location=row[9],
+                distance_miles=row[10] if len(row) > 10 else 25,
+                is_active=row[11] if len(row) > 11 else True,
+                created_at=row[12] if len(row) > 12 else ""
+            )
+            searches.append(search)
+        except Exception as e:
+            print(f"❌ Error processing search row {row[0]}: {e}")
+    
+    print(f"✅ Returning {len(searches)} valid searches")
+    return searches
 
 @app.put("/car-searches/{search_id}")
 async def update_car_search(search_id: int, search: CarSearchUpdate, user_id: int = Depends(verify_token)):
