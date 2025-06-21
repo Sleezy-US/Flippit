@@ -15,15 +15,34 @@ import time
 import json
 import statistics
 import requests
+import random
 
 # Import our car scraper
 from fb_scraper import CarSearchMonitor
+
+# Import enhanced scraper (if available)
+try:
+    from enhanced_fb_scraper import EnhancedCarSearchMonitor
+    ENHANCED_SCRAPER_AVAILABLE = True
+except ImportError:
+    ENHANCED_SCRAPER_AVAILABLE = False
+    print("⚠️  Enhanced scraper not available, using basic scraper")
+
+# Import the KBB estimator
+from kbb_value_estimator import KBBValueEstimator, enhance_car_listing_with_values
+
+# Initialize the value estimator
+value_estimator = KBBValueEstimator()
+
+# Configuration
+USE_MOCK_DATA = os.getenv("USE_MOCK_DATA", "true").lower() == "true"
+USE_SELENIUM = os.getenv("USE_SELENIUM", "false").lower() == "true"
 
 # Stripe configuration
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "sk_test_your_stripe_key_here")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "whsec_your_webhook_secret")
 
-app = FastAPI(title="Flippit - Enhanced Car Marketplace Monitor API", version="3.0.0")
+app = FastAPI(title="Flippit - Enhanced Car Marketplace Monitor API", version="3.1.0")
 
 # Enable CORS
 app.add_middleware(
@@ -51,7 +70,7 @@ ADMIN_EMAILS = ["johnsilva36@live.com"]  # Replace with your actual email
 # Enhanced Subscription Configuration with Feature Gating
 SUBSCRIPTION_INTERVALS = {
     'free': 1500,      # 25 minutes
-    'pro': 600,        # 10 minutes 
+    'pro': 600,        # 10 minutes
     'premium': 300,    # 5 minutes
 }
 
@@ -60,8 +79,8 @@ SUBSCRIPTION_LIMITS = {
         'max_searches': 3,
         'interval': 1500,
         'features': [
-            'basic_search', 
-            'basic_filtering', 
+            'basic_search',
+            'basic_filtering',
             'basic_deal_scoring',
             'limited_favorites'
         ]
@@ -70,8 +89,8 @@ SUBSCRIPTION_LIMITS = {
         'max_searches': 15,
         'interval': 600,
         'features': [
-            'basic_search', 
-            'advanced_filtering', 
+            'basic_search',
+            'advanced_filtering',
             'push_notifications',
             'price_analytics',
             'unlimited_favorites',
@@ -83,8 +102,8 @@ SUBSCRIPTION_LIMITS = {
         'max_searches': 15,
         'interval': 600,
         'features': [
-            'basic_search', 
-            'advanced_filtering', 
+            'basic_search',
+            'advanced_filtering',
             'push_notifications',
             'price_analytics',
             'unlimited_favorites',
@@ -96,8 +115,8 @@ SUBSCRIPTION_LIMITS = {
         'max_searches': 25,
         'interval': 300,
         'features': [
-            'basic_search', 
-            'advanced_filtering', 
+            'basic_search',
+            'advanced_filtering',
             'push_notifications',
             'price_analytics',
             'unlimited_favorites',
@@ -114,8 +133,8 @@ SUBSCRIPTION_LIMITS = {
         'max_searches': 25,
         'interval': 300,
         'features': [
-            'basic_search', 
-            'advanced_filtering', 
+            'basic_search',
+            'advanced_filtering',
             'push_notifications',
             'price_analytics',
             'unlimited_favorites',
@@ -291,7 +310,13 @@ def init_db():
             FOREIGN KEY (listing_id) REFERENCES car_listings (id)
         )
     ''')
-    
+     # Add deal_score column to existing car_listings table
+    try:
+        cursor.execute("ALTER TABLE car_listings ADD COLUMN deal_score REAL")
+        print("✅ Added deal_score column to car_listings table")
+    except sqlite3.OperationalError:
+        # Column already exists, that's fine
+        pass
     conn.commit()
     conn.close()
 
@@ -453,16 +478,31 @@ def get_tier_from_price_id(price_id: str) -> str:
     return tier_map.get(price_id, 'free')
 
 def enhanced_save_car_listings(search_id: int, cars: list):
-    """Enhanced car listing save with analytics and scoring"""
+    """Enhanced car listing save with analytics, scoring, and value estimates"""
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
     
+    # Get search details for make/model info
+    cursor.execute("SELECT make, model, location FROM car_searches WHERE id = ?", (search_id,))
+    search_info = cursor.fetchone()
+    search_make = search_info[0] if search_info else None
+    search_model = search_info[1] if search_info else None
+    
     for car in cars:
+        # Add make/model from search if not in car data
+        if not car.get('make') and search_make:
+            car['make'] = search_make
+        if not car.get('model') and search_model:
+            car['model'] = search_model
+            
+        # Enhance with value estimates
+        car = enhance_car_listing_with_values(car, value_estimator)
+        
         # Insert car listing with enhanced fields
         cursor.execute("""
             INSERT INTO car_listings 
-            (search_id, title, price, year, mileage, url, fuel_type, transmission, body_style, color)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (search_id, title, price, year, mileage, url, fuel_type, transmission, body_style, color, deal_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             search_id,
             car['title'],
@@ -473,10 +513,28 @@ def enhanced_save_car_listings(search_id: int, cars: list):
             car.get('fuel_type'),
             car.get('transmission'),
             car.get('body_style'),
-            car.get('color')
+            car.get('color'),
+            car.get('deal_score', {}).get('score') if car.get('has_analysis') else None
         ))
         
         listing_id = cursor.lastrowid
+        
+        # Save value estimate data if available
+        if car.get('has_analysis') and car.get('value_estimate'):
+            cursor.execute("""
+                INSERT INTO deal_scores 
+                (listing_id, market_price_estimate, deal_score, quality_indicators, calculated_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                listing_id,
+                car['value_estimate']['values']['private_party'],
+                car['deal_score']['score'],
+                json.dumps({
+                    'value_estimate': car['value_estimate'],
+                    'deal_score': car['deal_score']
+                }),
+                datetime.now().isoformat()
+            ))
         
         # Add to price history for analytics
         try:
@@ -489,15 +547,11 @@ def enhanced_save_car_listings(search_id: int, cars: list):
             mileage_text = car.get('mileage', '').replace(',', '').replace(' miles', '').replace('miles', '')
             mileage_num = int(mileage_text) if mileage_text.isdigit() else None
             
-            # Extract make/model from search
-            cursor.execute("SELECT make, model, location FROM car_searches WHERE id = ?", (search_id,))
-            search_info = cursor.fetchone()
-            
             if search_info and price_num:
                 cursor.execute("""
                     INSERT INTO price_history (make, model, year, location, price, mileage)
                     VALUES (?, ?, ?, ?, ?, ?)
-                """, (search_info[0], search_info[1], year_num, search_info[2], price_num, mileage_num))
+                """, (search_make, search_model, year_num, search_info[2], price_num, mileage_num))
         except Exception as e:
             print(f"Error saving price history: {e}")
     
@@ -537,14 +591,110 @@ def update_search_suggestions():
     conn.commit()
     conn.close()
 
+def get_mock_cars(search_config):
+    """Get mock car data with value estimates for testing"""
+    make = search_config.get('make', 'Toyota')
+    model = search_config.get('model', 'Camry')
+    location = search_config.get('location', 'Cape Coral, FL')
+    
+    mock_cars = [
+        {
+            "id": f"mock_{int(time.time())}_{random.randint(1000, 9999)}",
+            "title": f"2021 {make} {model} LE - Excellent Condition",
+            "price": "$19,500",
+            "year": "2021",
+            "make": make,
+            "model": model,
+            "mileage": "25,000 miles",
+            "url": f"https://facebook.com/marketplace/item/mock1",
+            "image_url": "https://images.unsplash.com/photo-1550355291-bbee04a92027?w=400",
+            "location": location,
+            "source": "mock_data",
+            "fuel_type": "Gasoline",
+            "transmission": "Automatic",
+            "scraped_at": datetime.now().isoformat()
+        },
+        {
+            "id": f"mock_{int(time.time())}_{random.randint(1000, 9999)}",
+            "title": f"2019 {make} {model} XLE - Low Miles",
+            "price": "$17,900",
+            "year": "2019",
+            "make": make,
+            "model": model,
+            "mileage": "38,000 miles",
+            "url": f"https://facebook.com/marketplace/item/mock2",
+            "image_url": "https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=400",
+            "location": location,
+            "source": "mock_data",
+            "fuel_type": "Gasoline",
+            "transmission": "Automatic",
+            "scraped_at": datetime.now().isoformat()
+        },
+        {
+            "id": f"mock_{int(time.time())}_{random.randint(1000, 9999)}",
+            "title": f"2020 {make} {model} SE - One Owner",
+            "price": "$16,500",  # Priced below market for a "hot deal"
+            "year": "2020",
+            "make": make,
+            "model": model,
+            "mileage": "42,000 miles",
+            "url": f"https://facebook.com/marketplace/item/mock3",
+            "image_url": "https://images.unsplash.com/photo-1503376780353-7e6692767b70?w=400",
+            "location": location,
+            "source": "mock_data",
+            "fuel_type": "Hybrid",
+            "transmission": "CVT",
+            "scraped_at": datetime.now().isoformat()
+        }
+    ]
+    
+    # Filter by price if specified
+    if search_config.get('price_max'):
+        mock_cars = [car for car in mock_cars
+                    if int(car['price'].replace('$', '').replace(',', '')) <= search_config['price_max']]
+    
+    # Enhance each car with value estimates
+    enhanced_cars = []
+    for car in mock_cars:
+        enhanced_car = enhance_car_listing_with_values(car, value_estimator)
+        enhanced_cars.append(enhanced_car)
+    
+    return enhanced_cars
+
+def _get_market_advice(make: str, model: str, price_data: list) -> str:
+    """Generate market advice based on data"""
+    if not price_data:
+        return "Limited market data available for this vehicle."
+    
+    # Simple trend analysis
+    if len(price_data) >= 2:
+        recent_avg = price_data[0][1]
+        older_avg = price_data[1][1]
+        
+        if recent_avg > older_avg * 1.05:
+            return "Prices are trending up. This model is holding value well."
+        elif recent_avg < older_avg * 0.95:
+            return "Prices are trending down. Good time to buy, but expect continued depreciation."
+        else:
+            return "Prices are stable. Market is balanced for this model."
+    
+    return "Monitor market trends before making a decision."
+
 # Background monitoring with enhanced features
 def run_continuous_monitoring():
     """Run enhanced car monitoring with subscription tiers"""
     global car_monitor
-    if car_monitor is None:
-        car_monitor = CarSearchMonitor()
     
-    print("🚀 Starting Enhanced Flippit monitoring with AI insights!")
+    # Initialize appropriate monitor
+    if car_monitor is None:
+        if ENHANCED_SCRAPER_AVAILABLE:
+            car_monitor = EnhancedCarSearchMonitor(use_selenium=USE_SELENIUM, use_mock_data=USE_MOCK_DATA)
+        else:
+            car_monitor = CarSearchMonitor()
+    
+    print("🚀 Starting Enhanced Flippit monitoring!")
+    print(f"📊 Mock data: {'Enabled' if USE_MOCK_DATA else 'Disabled'}")
+    print(f"🌐 Selenium: {'Enabled' if USE_SELENIUM and ENHANCED_SCRAPER_AVAILABLE else 'Disabled'}")
     
     while True:
         try:
@@ -554,7 +704,6 @@ def run_continuous_monitoring():
             for tier, limits in SUBSCRIPTION_LIMITS.items():
                 interval = limits['interval']
                 
-                # Get searches for this tier
                 tier_conditions = [tier]
                 if tier == 'pro':
                     tier_conditions.append('pro_yearly')
@@ -589,18 +738,29 @@ def run_continuous_monitoring():
                             'price_min': search_row[5],
                             'price_max': search_row[6],
                             'mileage_max': search_row[7],
-                            'location': search_row[8],
+                            'location': search_row[8] or 'Cape Coral, FL',
                         }
                         
                         try:
                             new_cars = car_monitor.monitor_car_search(search_config)
                             
+                            # If no real results and mock data is enabled, use mock data
+                            if not new_cars and USE_MOCK_DATA:
+                                print("📊 No real results, using mock data for testing")
+                                new_cars = get_mock_cars(search_config)
+                            
                             if new_cars:
-                                # Save with enhanced features
                                 enhanced_save_car_listings(search_id, new_cars)
                                 
                                 search_name = f"{search_config.get('make', '')} {search_config.get('model', '')}".strip()
-                                print(f"🚗 {tier.upper()} user found {len(new_cars)} new {search_name} cars!")
+                                print(f"🚗 Found {len(new_cars)} new {search_name} cars!")
+                                
+                                # Log the first car for debugging
+                                if new_cars:
+                                    first_car = new_cars[0]
+                                    print(f"   Example: {first_car['title']} - {first_car['price']}")
+                                    if first_car.get('deal_score'):
+                                        print(f"   Deal Score: {first_car['deal_score']['rating']}")
                         
                         except Exception as e:
                             print(f"❌ Error monitoring search {search_id}: {e}")
@@ -611,16 +771,14 @@ def run_continuous_monitoring():
             
             conn.close()
             
-            # Update search suggestions periodically
             update_search_suggestions()
             
-            # Wait before next cycle
             min_interval = min(limits['interval'] for limits in SUBSCRIPTION_LIMITS.values())
-            print(f"💤 Next enhanced monitoring cycle in {min_interval//60} minutes...")
+            print(f"💤 Next monitoring cycle in {min_interval//60} minutes...")
             time.sleep(min_interval)
             
         except Exception as e:
-            print(f"❌ Error in enhanced monitoring: {e}")
+            print(f"❌ Error in monitoring: {e}")
             time.sleep(60)
 
 # API Routes - Starting with existing ones, then enhanced
@@ -639,19 +797,19 @@ async def startup_event():
 @app.get("/")
 async def root():
     return {
-        "message": "🚗 Flippit - Enhanced Car Marketplace Monitor", 
-        "version": "3.0.0",
-        "features": "AI-powered deal scoring, push notifications, advanced analytics",
+        "message": "🚗 Flippit - Enhanced Car Marketplace Monitor",
+        "version": "3.1.0",
+        "features": "KBB-style values, AI-powered deal scoring, push notifications, advanced analytics",
         "docs": "/docs"
     }
 
 @app.get("/health")
 async def health_check():
     return {
-        "status": "healthy", 
+        "status": "healthy",
         "timestamp": datetime.utcnow(),
         "service": "Enhanced Flippit Car Monitor",
-        "version": "3.0.0"
+        "version": "3.1.0"
     }
 
 @app.get("/pricing")
@@ -664,30 +822,30 @@ async def get_pricing():
                 "price": "$0/month",
                 "searches": 3,
                 "refresh_minutes": 25,
-                "features": ["Basic search", "Basic filtering", "Basic notifications"]
+                "features": ["Basic search", "Basic filtering", "Basic notifications", "Value estimates"]
             },
             "pro": {
                 "name": "Pro",
-                "monthly_price": "$15/month", 
+                "monthly_price": "$15/month",
                 "yearly_price": "$153/year (15% off)",
                 "yearly_savings": "$27/year",
                 "searches": 15,
                 "refresh_minutes": 10,
                 "features": [
                     "Advanced filtering", "Push notifications", "Price analytics",
-                    "Unlimited favorites", "Car notes", "Priority support"
+                    "Unlimited favorites", "Car notes", "Priority support", "Hot deal alerts"
                 ]
             },
             "premium": {
                 "name": "Premium",
                 "monthly_price": "$50/month",
-                "yearly_price": "$480/year (20% off)", 
+                "yearly_price": "$480/year (20% off)",
                 "yearly_savings": "$120/year",
                 "searches": 25,
                 "refresh_minutes": 5,
                 "features": [
                     "All Pro features", "Map view", "AI insights", "Export data",
-                    "Social features", "Instant alerts", "Premium support"
+                    "Social features", "Instant alerts", "Premium support", "Market analytics"
                 ]
             }
         },
@@ -715,10 +873,10 @@ async def register(user: UserRegister):
         token = create_token(user_id)
         
         return {
-            "token": token, 
-            "user_id": user_id, 
+            "token": token,
+            "user_id": user_id,
             "subscription_tier": "free",
-            "message": "Welcome to Enhanced Flippit! You have 3 free searches with basic features. Upgrade to Pro for push notifications and advanced analytics!"
+            "message": "Welcome to Enhanced Flippit! You have 3 free searches with KBB-style value estimates. Upgrade to Pro for hot deal alerts!"
         }
     
     except sqlite3.IntegrityError:
@@ -761,7 +919,7 @@ async def login(user: UserLogin):
     conn.close()
     
     response = {
-        "token": token, 
+        "token": token,
         "user_id": user_id,
         "subscription_tier": current_tier
     }
@@ -821,7 +979,7 @@ async def get_subscription(user_id: int = Depends(verify_token)):
     
     pricing = {
         "free": "$0/month",
-        "pro": "$15/month", 
+        "pro": "$15/month",
         "pro_yearly": "$153/year (15% off)",
         "premium": "$50/month",
         "premium_yearly": "$480/year (20% off)"
@@ -872,14 +1030,14 @@ async def create_car_search(search: CarSearchCreate, user_id: int = Depends(veri
     
     if current_count >= max_searches:
         tier_display = {
-            "free": "Free (3 searches)", 
-            "pro": "Pro (15 searches)", 
+            "free": "Free (3 searches)",
+            "pro": "Pro (15 searches)",
             "pro_yearly": "Pro Annual (15 searches)",
             "premium": "Premium (25 searches)",
             "premium_yearly": "Premium Annual (25 searches)"
         }
         raise HTTPException(
-            status_code=403, 
+            status_code=403,
             detail=f"Search limit reached! {tier_display[subscription_tier]} allows {max_searches} searches. Upgrade for more searches and advanced features!"
         )
     
@@ -888,7 +1046,7 @@ async def create_car_search(search: CarSearchCreate, user_id: int = Depends(veri
         """INSERT INTO car_searches 
            (user_id, make, model, year_min, year_max, price_min, price_max, mileage_max, location) 
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (user_id, search.make, search.model, search.year_min, search.year_max, 
+        (user_id, search.make, search.model, search.year_min, search.year_max,
          search.price_min, search.price_max, search.mileage_max, search.location)
     )
     
@@ -1095,6 +1253,298 @@ async def get_favorites(user_id: int = Depends(verify_token)):
     
     return {"favorites": favorites}
 
+# NEW ENDPOINTS FOR KBB VALUES AND ENHANCED FEATURES
+
+@app.get("/all-deals")
+async def get_all_deals(user_id: int = Depends(verify_token)):
+    """Get all found cars from all user's searches with value analysis"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT cl.*, cs.make, cs.model, ds.quality_indicators
+        FROM car_listings cl
+        JOIN car_searches cs ON cl.search_id = cs.id
+        LEFT JOIN deal_scores ds ON cl.id = ds.listing_id
+        WHERE cs.user_id = ?
+        ORDER BY cl.found_at DESC
+        LIMIT 100
+    """, (user_id,))
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    deals = []
+    for row in rows:
+        deal = {
+            "id": row[0],
+            "search_id": row[1],
+            "title": row[2],
+            "price": row[3],
+            "year": row[4],
+            "mileage": row[5],
+            "url": row[6],
+            "found_at": row[7],
+            "fuel_type": row[9],
+            "transmission": row[10],
+            "body_style": row[11],
+            "color": row[12],
+            "search_make": row[19],
+            "search_model": row[20],
+            "is_mock": "mock_data" in (row[6] or "")
+        }
+        
+        # Add value analysis if available
+        if row[21]:  # quality_indicators JSON
+            try:
+                analysis_data = json.loads(row[21])
+                deal['value_estimate'] = analysis_data.get('value_estimate')
+                deal['deal_score'] = analysis_data.get('deal_score')
+                deal['has_analysis'] = True
+            except:
+                deal['has_analysis'] = False
+        else:
+            deal['has_analysis'] = False
+        
+        deals.append(deal)
+    
+    return {"deals": deals, "total": len(deals)}
+
+@app.get("/test-search/{search_id}")
+async def test_car_search(search_id: int, user_id: int = Depends(verify_token)):
+    """Manually trigger a search test with mock data"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Get search details
+    cursor.execute("""
+        SELECT * FROM car_searches 
+        WHERE id = ? AND user_id = ?
+    """, (search_id, user_id))
+    
+    search = cursor.fetchone()
+    if not search:
+        raise HTTPException(status_code=404, detail="Search not found")
+    
+    search_config = {
+        'make': search[2],
+        'model': search[3],
+        'year_min': search[4],
+        'year_max': search[5],
+        'price_min': search[6],
+        'price_max': search[7],
+        'mileage_max': search[8],
+        'location': search[9] or 'Cape Coral, FL',
+    }
+    
+    # Force mock data for testing
+    mock_cars = get_mock_cars(search_config)
+    
+    # Save mock cars
+    enhanced_save_car_listings(search_id, mock_cars)
+    
+    conn.close()
+    
+    return {
+        "message": f"Added {len(mock_cars)} test cars with value analysis",
+        "cars": mock_cars[:1]  # Return first car as example
+    }
+
+@app.get("/value-estimate")
+async def get_value_estimate(
+    make: str,
+    model: str,
+    year: int,
+    mileage: Optional[int] = None,
+    price: Optional[int] = None,
+    condition: str = "good",
+    user_id: int = Depends(verify_token)
+):
+    """Get KBB-style value estimate for a car"""
+    try:
+        estimate = value_estimator.estimate_value(
+            make=make,
+            model=model,
+            year=year,
+            mileage=mileage,
+            condition=condition
+        )
+        
+        # Calculate deal score if price provided
+        deal_score = None
+        if price:
+            deal_score = value_estimator.calculate_deal_score(price, estimate)
+        
+        return {
+            "value_estimate": estimate,
+            "deal_score": deal_score,
+            "disclaimer": estimate['disclaimer']
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/market-insights/{make}/{model}")
+async def get_market_insights(
+    make: str,
+    model: str,
+    user_id: int = Depends(verify_token)
+):
+    """Get market insights for a specific make/model"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Get price history data
+    cursor.execute("""
+        SELECT year, AVG(price) as avg_price, COUNT(*) as count,
+               MIN(price) as min_price, MAX(price) as max_price
+        FROM price_history
+        WHERE make = ? AND model = ?
+        GROUP BY year
+        ORDER BY year DESC
+        LIMIT 10
+    """, (make, model))
+    
+    price_data = cursor.fetchall()
+    
+    # Get recent listings
+    cursor.execute("""
+        SELECT COUNT(*) as total_listings,
+               AVG(CAST(REPLACE(REPLACE(price, '$', ''), ',', '') AS INTEGER)) as avg_listing_price
+        FROM car_listings cl
+        JOIN car_searches cs ON cl.search_id = cs.id
+        WHERE cs.make = ? AND cs.model = ?
+        AND cl.found_at > datetime('now', '-30 days')
+    """, (make, model))
+    
+    recent_stats = cursor.fetchone()
+    conn.close()
+    
+    insights = {
+        "make": make,
+        "model": model,
+        "price_trends": [
+            {
+                "year": row[0],
+                "avg_price": row[1],
+                "listing_count": row[2],
+                "price_range": f"${row[3]:,} - ${row[4]:,}"
+            } for row in price_data
+        ],
+        "recent_activity": {
+            "listings_last_30_days": recent_stats[0] if recent_stats else 0,
+            "avg_listing_price": f"${int(recent_stats[1]):,}" if recent_stats and recent_stats[1] else "N/A"
+        },
+        "market_advice": _get_market_advice(make, model, price_data)
+    }
+    
+    return insights
+
+@app.get("/hot-deals")
+async def get_hot_deals(user_id: int = Depends(verify_token)):
+    """Get only the hottest deals (score > 85)"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT cl.*, cs.make, cs.model, ds.quality_indicators
+        FROM car_listings cl
+        JOIN car_searches cs ON cl.search_id = cs.id
+        LEFT JOIN deal_scores ds ON cl.id = ds.listing_id
+        WHERE cs.user_id = ? AND cl.deal_score >= 85
+        ORDER BY cl.deal_score DESC, cl.found_at DESC
+        LIMIT 20
+    """, (user_id,))
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    hot_deals = []
+    for row in rows:
+        deal = {
+            "id": row[0],
+            "search_id": row[1],
+            "title": row[2],
+            "price": row[3],
+            "year": row[4],
+            "mileage": row[5],
+            "url": row[6],
+            "found_at": row[7],
+            "deal_score": row[15],
+            "search_make": row[19],
+            "search_model": row[20],
+            "is_mock": "mock_data" in (row[6] or "")
+        }
+        
+        if row[21]:  # quality_indicators JSON
+            try:
+                analysis_data = json.loads(row[21])
+                deal['value_estimate'] = analysis_data.get('value_estimate')
+                deal['deal_analysis'] = analysis_data.get('deal_score')
+            except:
+                pass
+        
+        hot_deals.append(deal)
+    
+    return {"hot_deals": hot_deals, "total": len(hot_deals)}
+
+@app.get("/search-analytics/{search_id}")
+async def get_search_analytics(search_id: int, user_id: int = Depends(verify_token)):
+    """Get analytics for a specific search"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Verify ownership
+    cursor.execute("SELECT * FROM car_searches WHERE id = ? AND user_id = ?", (search_id, user_id))
+    search = cursor.fetchone()
+    if not search:
+        raise HTTPException(status_code=404, detail="Search not found")
+    
+    # Get stats
+    cursor.execute("""
+        SELECT 
+            COUNT(*) as total_found,
+            AVG(CAST(REPLACE(REPLACE(price, '$', ''), ',', '') AS REAL)) as avg_price,
+            MIN(CAST(REPLACE(REPLACE(price, '$', ''), ',', '') AS INTEGER)) as min_price,
+            MAX(CAST(REPLACE(REPLACE(price, '$', ''), ',', '') AS INTEGER)) as max_price,
+            AVG(deal_score) as avg_deal_score,
+            SUM(CASE WHEN deal_score >= 85 THEN 1 ELSE 0 END) as hot_deals_count
+        FROM car_listings
+        WHERE search_id = ?
+    """, (search_id,))
+    
+    stats = cursor.fetchone()
+    conn.close()
+    
+    return {
+        "search_id": search_id,
+        "make": search[2],
+        "model": search[3],
+        "analytics": {
+            "total_cars_found": stats[0] or 0,
+            "average_price": f"${int(stats[1]):,}" if stats[1] else "N/A",
+            "price_range": f"${stats[2]:,} - ${stats[3]:,}" if stats[2] and stats[3] else "N/A",
+            "average_deal_score": round(stats[4], 1) if stats[4] else 0,
+            "hot_deals_found": stats[5] or 0
+        }
+    }
+
+@app.get("/config")
+async def get_config():
+    """Get current configuration"""
+    return {
+        "use_mock_data": USE_MOCK_DATA,
+        "use_selenium": USE_SELENIUM,
+        "enhanced_scraper": ENHANCED_SCRAPER_AVAILABLE,
+        "version": "3.1.0",
+        "features": {
+            "kbb_values": True,
+            "deal_scoring": True,
+            "market_insights": True,
+            "mock_data": USE_MOCK_DATA,
+            "hot_deals": True
+        }
+    }
+
 # STRIPE WEBHOOK ENDPOINTS
 
 @app.post("/stripe-webhook")
@@ -1216,7 +1666,7 @@ async def gift_subscription(gift: GiftSubscription, admin_id: int = Depends(veri
             recipient_id = recipient[0]
             # Update existing user
             cursor.execute(
-                "UPDATE users SET subscription_tier = ?, gifted_by = ? WHERE id = ?", 
+                "UPDATE users SET subscription_tier = ?, gifted_by = ? WHERE id = ?",
                 (gift.tier, ADMIN_EMAILS[0], recipient_id)
             )
         
@@ -1243,8 +1693,8 @@ async def gift_subscription(gift: GiftSubscription, admin_id: int = Depends(veri
 
 @app.post("/admin/bulk-gift")
 async def bulk_gift_subscriptions(
-    emails: List[str], 
-    tier: str, 
+    emails: List[str],
+    tier: str,
     duration_months: int = 1,
     admin_id: int = Depends(verify_admin)
 ):
@@ -1274,6 +1724,6 @@ async def bulk_gift_subscriptions(
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    print("🚀 Starting Enhanced Flippit API Server v3.0.0")
-    print("✨ New Features: AI Deal Scoring, Push Notifications, Advanced Analytics")
+    print("🚀 Starting Enhanced Flippit API Server v3.1.0")
+    print("✨ New Features: KBB-style Value Estimates, AI Deal Scoring, Market Analytics")
     uvicorn.run(app, host="0.0.0.0", port=port)
