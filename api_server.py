@@ -822,6 +822,14 @@ def run_continuous_monitoring():
             conn = sqlite3.connect(DATABASE)
             cursor = conn.cursor()
             
+            # Check total searches first
+            cursor.execute("SELECT COUNT(*) FROM car_searches WHERE is_active = TRUE")
+            total_searches = cursor.fetchone()[0]
+            print(f"📊 Total active searches in database: {total_searches}")
+            
+            if total_searches == 0:
+                print("⚠️  No active searches found - users need to create searches first!")
+            
             # Process searches by tier
             for tier, limits in SUBSCRIPTION_LIMITS.items():
                 tier_conditions = [tier]
@@ -842,6 +850,7 @@ def run_continuous_monitoring():
                 """, tier_conditions)
                 
                 tier_searches = cursor.fetchall()
+                print(f"🔍 Found {len(tier_searches)} searches for tier: {tier}")
                 
                 if tier_searches:
                     print(f"🔄 Processing {len(tier_searches)} {tier.upper()} searches")
@@ -1566,6 +1575,61 @@ async def get_all_deals(user_id: int = Depends(verify_token)):
         print(f"Error in all-deals: {e}")
         conn.close()
         return {"deals": [], "total": 0}
+
+@app.get("/force-search-cycle")
+async def force_search_cycle():
+    """Manually trigger a search cycle for debugging"""
+    try:
+        conn = sqlite3.connect(DATABASE)
+        cursor = conn.cursor()
+        
+        # Check total searches
+        cursor.execute("SELECT COUNT(*) FROM car_searches WHERE is_active = TRUE")
+        total_searches = cursor.fetchone()[0]
+        
+        if total_searches == 0:
+            return {"message": "No active searches found. Create a search first!", "total_searches": 0}
+        
+        # Get a sample search to test
+        cursor.execute("""
+            SELECT cs.id, cs.make, cs.model, cs.location, u.subscription_tier
+            FROM car_searches cs
+            JOIN users u ON cs.user_id = u.id 
+            WHERE cs.is_active = TRUE
+            LIMIT 1
+        """)
+        
+        search = cursor.fetchone()
+        if not search:
+            return {"message": "No valid search found", "total_searches": total_searches}
+        
+        search_id, make, model, location, tier = search
+        
+        # Force mock data for this search
+        search_config = {
+            'make': make or 'Toyota',
+            'model': model or 'Camry',
+            'location': location or 'Cape Coral, FL'
+        }
+        
+        mock_cars = get_mock_cars(search_config)
+        enhanced_save_car_listings(search_id, mock_cars)
+        
+        conn.close()
+        
+        return {
+            "message": f"Successfully added {len(mock_cars)} mock cars to search {search_id}",
+            "search_info": {
+                "id": search_id,
+                "make": make,
+                "model": model,
+                "tier": tier
+            },
+            "cars_added": len(mock_cars)
+        }
+        
+    except Exception as e:
+        return {"error": str(e), "message": "Failed to force search cycle"}
 
 @app.get("/test-search/{search_id}")
 async def test_car_search(search_id: int, user_id: int = Depends(verify_token)):
