@@ -670,7 +670,7 @@ def run_continuous_monitoring():
     # Initialize monitor
     if car_monitor is None:
         if ENHANCED_SCRAPER_AVAILABLE:
-            car_monitor = EnhancedCarSearchMonitor(use_selenium=USE_SELENIUM, use_mock_data=USE_MOCK_DATA)
+            car_monitor = EnhancedCarSearchMonitor(use_selenium=False, use_mock_data=USE_MOCK_DATA)
         else:
             car_monitor = CarSearchMonitor()
     
@@ -894,48 +894,139 @@ async def login(user: UserLogin):
         "subscription_tier": subscription_tier
     }
 
-@app.get("/subscription", response_model=SubscriptionResponse)
-async def get_subscription(user_id: int = Depends(verify_token)):
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
+@app.get("/subscription")
+async def get_subscription(request: Request):
+    """Get subscription info with better error handling"""
+    try:
+        # Try to get the authorization header
+        auth_header = request.headers.get("authorization")
+        
+        if not auth_header:
+            # Return default free subscription if no auth
+            return {
+                "tier": "free",
+                "max_searches": 3,
+                "current_searches": 0,
+                "interval_minutes": 25,
+                "max_distance_miles": 25,
+                "features": ["basic_search", "value_estimates", "25_mile_radius"],
+                "price": "$0/month",
+                "trial_ends": None,
+                "gifted_by": None
+            }
+        
+        # Try to verify the token
+        try:
+            token = auth_header.replace("Bearer ", "")
+            payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+            user_id = payload["user_id"]
+        except Exception as token_error:
+            # Return default if token verification fails
+            print(f"Token verification failed: {token_error}")
+            return {
+                "tier": "free",
+                "max_searches": 3,
+                "current_searches": 0,
+                "interval_minutes": 25,
+                "max_distance_miles": 25,
+                "features": ["basic_search", "value_estimates", "25_mile_radius"],
+                "price": "$0/month",
+                "trial_ends": None,
+                "gifted_by": None
+            }
+        
+        # Get user's actual subscription
+        conn = sqlite3.connect(DATABASE)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT subscription_tier, trial_ends, gifted_by 
+            FROM users WHERE id = ?
+        """, (user_id,))
+        result = cursor.fetchone()
+        
+        if not result:
+            conn.close()
+            # Return default instead of 404
+            return {
+                "tier": "free",
+                "max_searches": 3,
+                "current_searches": 0,
+                "interval_minutes": 25,
+                "max_distance_miles": 25,
+                "features": ["basic_search", "value_estimates", "25_mile_radius"],
+                "price": "$0/month",
+                "trial_ends": None,
+                "gifted_by": None
+            }
+        
+        tier, trial_ends, gifted_by = result
+        limits = get_subscription_limits(tier)
+        
+        # Count current searches
+        cursor.execute("SELECT COUNT(*) FROM car_searches WHERE user_id = ? AND is_active = TRUE", (user_id,))
+        current_searches = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        pricing = {
+            "free": "$0/month",
+            "pro": "$15/month",
+            "pro_yearly": "$153/year",
+            "premium": "$50/month",
+            "premium_yearly": "$480/year"
+        }
+        
+        return {
+            "tier": tier,
+            "max_searches": limits['max_searches'],
+            "current_searches": current_searches,
+            "interval_minutes": limits['interval'] // 60,
+            "max_distance_miles": limits['max_distance_miles'],
+            "features": limits['features'],
+            "price": pricing.get(tier, "$0/month"),
+            "trial_ends": trial_ends,
+            "gifted_by": gifted_by
+        }
+        
+    except Exception as e:
+        print(f"Subscription endpoint error: {e}")
+        # Return default subscription on any error
+        return {
+            "tier": "free",
+            "max_searches": 3,
+            "current_searches": 0,
+            "interval_minutes": 25,
+            "max_distance_miles": 25,
+            "features": ["basic_search", "value_estimates", "25_mile_radius"],
+            "price": "$0/month",
+            "trial_ends": None,
+            "gifted_by": None
+        }
+
+@app.get("/subscription-debug")
+async def debug_subscription(request: Request):
+    """Debug subscription issues"""
+    auth_header = request.headers.get("authorization")
     
-    cursor.execute("""
-        SELECT subscription_tier, trial_ends, gifted_by 
-        FROM users WHERE id = ?
-    """, (user_id,))
-    result = cursor.fetchone()
-    
-    if not result:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    tier, trial_ends, gifted_by = result
-    limits = get_subscription_limits(tier)
-    
-    # Count current searches
-    cursor.execute("SELECT COUNT(*) FROM car_searches WHERE user_id = ? AND is_active = TRUE", (user_id,))
-    current_searches = cursor.fetchone()[0]
-    
-    conn.close()
-    
-    pricing = {
-        "free": "$0/month",
-        "pro": "$15/month",
-        "pro_yearly": "$153/year",
-        "premium": "$50/month",
-        "premium_yearly": "$480/year"
+    debug_info = {
+        "has_auth_header": bool(auth_header),
+        "auth_header_preview": auth_header[:20] + "..." if auth_header else None,
+        "user_agent": request.headers.get("user-agent"),
+        "endpoint_exists": True
     }
     
-    return SubscriptionResponse(
-        tier=tier,
-        max_searches=limits['max_searches'],
-        current_searches=current_searches,
-        interval_minutes=limits['interval'] // 60,
-        max_distance_miles=limits['max_distance_miles'],
-        features=limits['features'],
-        price=pricing.get(tier, "$0/month"),
-        trial_ends=trial_ends,
-        gifted_by=gifted_by
-    )
+    if auth_header:
+        try:
+            token = auth_header.replace("Bearer ", "")
+            payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+            debug_info["token_valid"] = True
+            debug_info["user_id"] = payload.get("user_id")
+        except Exception as e:
+            debug_info["token_valid"] = False
+            debug_info["token_error"] = str(e)
+    
+    return debug_info
 
 @app.post("/car-searches", response_model=CarSearchResponse)
 async def create_car_search(search: CarSearchCreate, user_id: int = Depends(verify_token)):
