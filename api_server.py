@@ -435,7 +435,7 @@ class CarSearchCreate(BaseModel):
     price_min: Optional[int] = DEFAULT_MIN_PRICE
     price_max: Optional[int] = DEFAULT_MAX_PRICE
     mileage_max: Optional[int] = None
-    location: Optional[str] = "Cape Coral, FL"
+    location: Optional[str] = "Miami, FL"
     distance_miles: Optional[int] = None  # Will be set based on subscription
 
 class CarSearchUpdate(BaseModel):
@@ -614,14 +614,14 @@ def get_location_info(location_str: str) -> dict:
         if city in location_lower:
             return info
     
-    # Default to Cape Coral if not found
-    return FLORIDA_CITIES["cape coral"]
+    # Default to Miami if not found
+    return FLORIDA_CITIES["miami"]
 
 def get_mock_cars(search_config):
     """Get mock car data with value estimates for testing"""
     make = search_config.get('make', 'Toyota')
     model = search_config.get('model', 'Camry')
-    location = search_config.get('location', 'Cape Coral, FL')
+    location = search_config.get('location', 'Miami, FL')
     
     # Create realistic mock cars with varying prices for different deal scores
     mock_cars = [
@@ -870,7 +870,7 @@ def run_continuous_monitoring():
                             'price_min': search_row[5],
                             'price_max': search_row[6],
                             'mileage_max': search_row[7],
-                            'location': search_row[8] or 'Cape Coral, FL',
+                            'location': search_row[8] or 'Miami, FL',
                             'distance_miles': search_row[9],
                             'lat': location_info['lat'],
                             'lng': location_info['lng'],
@@ -1443,6 +1443,48 @@ async def create_car_search(search: CarSearchCreate, user_id: int = Depends(veri
     print(f"🎉 Returning search: {result.dict()}")
     return result
 
+@app.get("/search-defaults")
+async def get_search_defaults(user_id: int = Depends(verify_token)):
+    """Get default search values based on user's subscription tier"""
+    tier = get_user_subscription_tier(user_id)
+    limits = get_subscription_limits(tier)
+    
+    return {
+        "defaults": {
+            "make": None,
+            "model": None,
+            "year_min": DEFAULT_MIN_YEAR,
+            "year_max": DEFAULT_MAX_YEAR,
+            "price_min": DEFAULT_MIN_PRICE,
+            "price_max": DEFAULT_MAX_PRICE,
+            "mileage_max": None,
+            "location": "Miami, FL",
+            "distance_miles": limits['max_distance_miles']
+        },
+        "limits": {
+            "max_distance_miles": limits['max_distance_miles'],
+            "max_searches": limits['max_searches'],
+            "tier": tier
+        },
+        "distance_options": [
+            {"value": 10, "label": "10 miles", "available": 10 <= limits['max_distance_miles']},
+            {"value": 25, "label": "25 miles", "available": 25 <= limits['max_distance_miles']},
+            {"value": 50, "label": "50 miles", "available": 50 <= limits['max_distance_miles']},
+            {"value": 100, "label": "100 miles", "available": 100 <= limits['max_distance_miles']},
+            {"value": 200, "label": "200 miles", "available": 200 <= limits['max_distance_miles']}
+        ],
+        "year_range": {
+            "min_allowed": MIN_CAR_YEAR,
+            "max_allowed": DEFAULT_MAX_YEAR,
+            "default_min": DEFAULT_MIN_YEAR,
+            "default_max": DEFAULT_MAX_YEAR
+        },
+        "price_range": {
+            "default_min": DEFAULT_MIN_PRICE,
+            "default_max": DEFAULT_MAX_PRICE
+        }
+    }
+
 @app.get("/debug-searches")
 async def debug_searches(request: Request):
     """Debug endpoint to check all searches and user info"""
@@ -1659,7 +1701,9 @@ async def get_all_deals(user_id: int = Depends(verify_token)):
                 "deal_score_value": row[10],
                 "search_make": row[11],
                 "search_model": row[12],
-                "is_mock": "mock_data" in (row[6] or "")
+                "is_mock": "mock" in (row[6] or "") or "test" in (row[6] or ""),
+                "is_test_car": "mock" in (row[6] or "") or "test" in (row[6] or ""),
+                "car_type": "Test Car" if ("mock" in (row[6] or "") or "test" in (row[6] or "")) else "Real Listing"
             }
             
             # Add value analysis if available
@@ -1716,7 +1760,7 @@ async def force_search_cycle():
         search_config = {
             'make': make or 'Toyota',
             'model': model or 'Camry',
-            'location': location or 'Cape Coral, FL'
+            'location': location or 'Miami, FL'
         }
         
         mock_cars = get_mock_cars(search_config)
@@ -1738,9 +1782,125 @@ async def force_search_cycle():
     except Exception as e:
         return {"error": str(e), "message": "Failed to force search cycle"}
 
+@app.delete("/clear-test-cars/{search_id}")
+async def clear_test_cars(search_id: int, user_id: int = Depends(verify_token)):
+    """Clear all test/mock cars for a specific search"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Verify ownership
+    cursor.execute("SELECT user_id FROM car_searches WHERE id = ?", (search_id,))
+    search_owner = cursor.fetchone()
+    
+    if not search_owner or search_owner[0] != user_id:
+        raise HTTPException(status_code=404, detail="Search not found")
+    
+    # Delete mock cars (ones with mock URLs)
+    cursor.execute("""
+        DELETE FROM car_listings 
+        WHERE search_id = ? AND (url LIKE '%mock%' OR url LIKE '%test%')
+    """, (search_id,))
+    
+    deleted_count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    
+    return {
+        "message": f"Cleared {deleted_count} test cars from search {search_id}",
+        "deleted_count": deleted_count
+    }
+
+@app.delete("/clear-all-test-cars")
+async def clear_all_test_cars(user_id: int = Depends(verify_token)):
+    """Clear ALL test/mock cars for the current user - ONE CLICK CLEANUP"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Delete mock cars for all user's searches
+    cursor.execute("""
+        DELETE FROM car_listings 
+        WHERE search_id IN (
+            SELECT id FROM car_searches WHERE user_id = ?
+        ) AND (url LIKE '%mock%' OR url LIKE '%test%')
+    """, (user_id,))
+    
+    deleted_count = cursor.rowcount
+    
+    # Also clear associated deal scores for deleted listings
+    cursor.execute("""
+        DELETE FROM deal_scores 
+        WHERE listing_id NOT IN (SELECT id FROM car_listings)
+    """)
+    
+    conn.commit()
+    conn.close()
+    
+    return {
+        "success": True,
+        "message": f"✅ Cleaned up! Removed {deleted_count} test cars from all searches",
+        "deleted_count": deleted_count,
+        "action": "All test cars have been removed. You now see only real listings."
+    }
+
+@app.get("/search-stats/{search_id}")
+async def get_search_stats(search_id: int, user_id: int = Depends(verify_token)):
+    """Get statistics about a search including test vs real cars"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Verify ownership
+    cursor.execute("SELECT user_id, make, model FROM car_searches WHERE id = ?", (search_id,))
+    search_info = cursor.fetchone()
+    
+    if not search_info or search_info[0] != user_id:
+        raise HTTPException(status_code=404, detail="Search not found")
+    
+    # Count total cars
+    cursor.execute("SELECT COUNT(*) FROM car_listings WHERE search_id = ?", (search_id,))
+    total_cars = cursor.fetchone()[0]
+    
+    # Count test cars
+    cursor.execute("""
+        SELECT COUNT(*) FROM car_listings 
+        WHERE search_id = ? AND (url LIKE '%mock%' OR url LIKE '%test%')
+    """, (search_id,))
+    test_cars = cursor.fetchone()[0]
+    
+    # Count real cars
+    real_cars = total_cars - test_cars
+    
+    # Get latest cars
+    cursor.execute("""
+        SELECT title, price, url, found_at 
+        FROM car_listings 
+        WHERE search_id = ? 
+        ORDER BY found_at DESC 
+        LIMIT 5
+    """, (search_id,))
+    latest_cars = cursor.fetchall()
+    
+    conn.close()
+    
+    return {
+        "search_id": search_id,
+        "search_name": f"{search_info[1] or ''} {search_info[2] or ''}".strip() or "All Cars",
+        "total_cars": total_cars,
+        "real_cars": real_cars,
+        "test_cars": test_cars,
+        "has_test_cars": test_cars > 0,
+        "latest_cars": [
+            {
+                "title": car[0],
+                "price": car[1],
+                "is_test": "mock" in (car[2] or ""),
+                "found_at": car[3]
+            } for car in latest_cars
+        ]
+    }
+
 @app.get("/test-search/{search_id}")
 async def test_car_search(search_id: int, user_id: int = Depends(verify_token)):
-    """Manually trigger a search test with mock data"""
+    """Manually trigger a search test with mock data (auto-clears old test cars)"""
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
     
@@ -1753,6 +1913,13 @@ async def test_car_search(search_id: int, user_id: int = Depends(verify_token)):
     if not search:
         raise HTTPException(status_code=404, detail="Search not found")
     
+    # AUTO-CLEAR: Remove old test cars first
+    cursor.execute("""
+        DELETE FROM car_listings 
+        WHERE search_id = ? AND (url LIKE '%mock%' OR url LIKE '%test%')
+    """, (search_id,))
+    old_test_cars = cursor.rowcount
+    
     search_config = {
         'make': search[2],
         'model': search[3],
@@ -1761,20 +1928,21 @@ async def test_car_search(search_id: int, user_id: int = Depends(verify_token)):
         'price_min': search[6],
         'price_max': search[7],
         'mileage_max': search[8],
-        'location': search[9] or 'Cape Coral, FL',
+        'location': search[9] or 'Miami, FL',
         'distance_miles': search[10] if len(search) > 10 else 25
     }
     
-    # Force mock data
+    # Add fresh mock cars
     mock_cars = get_mock_cars(search_config)
-    
-    # Save mock cars
     enhanced_save_car_listings(search_id, mock_cars)
     
+    conn.commit()
     conn.close()
     
     return {
-        "message": f"Added {len(mock_cars)} test cars with value analysis",
+        "message": f"Replaced {old_test_cars} old test cars with {len(mock_cars)} fresh test cars",
+        "old_test_cars_removed": old_test_cars,
+        "new_test_cars_added": len(mock_cars),
         "search_config": search_config,
         "sample_car": mock_cars[0] if mock_cars else None
     }
