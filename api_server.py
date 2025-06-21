@@ -1641,4 +1641,9 @@ async def get_config():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    print("🍎 Starting Enhanced Flippit API Server v3.2.0 with iOS
+    print("🍎 Starting Enhanced Flippit API Server v3.2.0 with iOS In-App Purchase")
+    print("✨ Features: iOS IAP, Distance-based search limits, KBB values, Deal scoring")
+    print(f"📍 Free: 25 miles | Pro: 50 miles | Premium: 200 miles")
+    print(f"💰 Pricing: Pro $14.99/mo or $152.99/yr (15% off) | Premium $49.99/mo or $479.99/yr (20% off)")
+    print(f"🔑 Secret key configured: {SECRET_KEY[:10]}... (length: {len(SECRET_KEY)})")
+    uvicorn.run(app, host="0.0.0.0", port=port)
