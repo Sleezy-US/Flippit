@@ -5,7 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import asyncio
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import hashlib
 from jose import jwt, JWTError
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,9 @@ import requests
 import random
 import base64
 import hmac
+
+# Import our database module
+from database import init_db, get_db_cursor, execute_query, execute_insert
 
 # Import our car scraper
 from fb_scraper import CarSearchMonitor
@@ -63,9 +67,6 @@ SECRET_KEY = os.getenv("SECRET_KEY", "flippit-default-secret-key-change-this-in-
 # Print secret key info for debugging (remove in production)
 print(f"🔑 Using SECRET_KEY: {SECRET_KEY[:10]}... (length: {len(SECRET_KEY)})")
 
-# Database
-DATABASE = "car_marketplace.db"
-
 # Global monitor instance
 car_monitor = None
 monitor_thread = None
@@ -76,7 +77,7 @@ ADMIN_EMAILS = ["johnsilva36@live.com"]
 # Constants for reasonable defaults
 CURRENT_YEAR = datetime.now().year
 MIN_CAR_YEAR = 1900  # First mass-produced cars
-DEFAULT_MIN_YEAR = CURRENT_YEAR - 20  # Default to last 20 years
+DEFAULT_MIN_YEAR = 1990  # Changed from CURRENT_YEAR - 20
 DEFAULT_MAX_YEAR = CURRENT_YEAR + 1  # Allow for next year's models
 DEFAULT_MIN_PRICE = 500
 DEFAULT_MAX_PRICE = 100000
@@ -216,207 +217,6 @@ FLORIDA_CITIES = {
     "port charlotte": {"lat": 26.9762, "lng": -82.0906, "fb_id": "103136976395671"},
     "bonita springs": {"lat": 26.3398, "lng": -81.7787, "fb_id": "112724155411170"}
 }
-
-def init_db():
-    """Initialize SQLite database with enhanced features"""
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    
-    # Users table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            subscription_tier TEXT DEFAULT 'free',
-            subscription_expires TIMESTAMP,
-            trial_ends TIMESTAMP,
-            is_trial BOOLEAN DEFAULT FALSE,
-            apple_receipt_data TEXT,
-            apple_original_transaction_id TEXT,
-            apple_latest_transaction_id TEXT,
-            apple_subscription_id TEXT,
-            cancel_at_period_end BOOLEAN DEFAULT FALSE,
-            gifted_by TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # iOS In-App Purchase receipts table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS apple_receipts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            receipt_data TEXT NOT NULL,
-            transaction_id TEXT UNIQUE NOT NULL,
-            original_transaction_id TEXT,
-            product_id TEXT NOT NULL,
-            purchase_date TIMESTAMP,
-            expires_date TIMESTAMP,
-            is_active BOOLEAN DEFAULT TRUE,
-            verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )
-    ''')
-    
-    # Car searches table with distance
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS car_searches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            make TEXT,
-            model TEXT,
-            year_min INTEGER,
-            year_max INTEGER,
-            price_min INTEGER,
-            price_max INTEGER,
-            mileage_max INTEGER,
-            location TEXT,
-            distance_miles INTEGER DEFAULT 25,
-            is_active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )
-    ''')
-    
-    # Car listings table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS car_listings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            search_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            price TEXT,
-            year TEXT,
-            mileage TEXT,
-            url TEXT,
-            found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            notified BOOLEAN DEFAULT FALSE,
-            fuel_type TEXT,
-            transmission TEXT,
-            body_style TEXT,
-            color TEXT,
-            location_lat REAL,
-            location_lng REAL,
-            distance_miles REAL,
-            deal_score REAL,
-            is_featured BOOLEAN DEFAULT FALSE,
-            FOREIGN KEY (search_id) REFERENCES car_searches (id)
-        )
-    ''')
-    
-    # Push notification tokens
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS push_tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            token TEXT NOT NULL,
-            platform TEXT NOT NULL,
-            is_active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id),
-            UNIQUE(user_id, token)
-        )
-    ''')
-    
-    # Price history for analytics
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS price_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            make TEXT,
-            model TEXT,
-            year INTEGER,
-            location TEXT,
-            price INTEGER,
-            mileage INTEGER,
-            recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Favorites table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS favorites (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            listing_id INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id),
-            FOREIGN KEY (listing_id) REFERENCES car_listings (id),
-            UNIQUE(user_id, listing_id)
-        )
-    ''')
-    
-    # Car notes
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS car_notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            listing_id INTEGER NOT NULL,
-            note TEXT,
-            status TEXT DEFAULT 'interested',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id),
-            FOREIGN KEY (listing_id) REFERENCES car_listings (id)
-        )
-    ''')
-    
-    # Search suggestions
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS search_suggestions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            make TEXT,
-            model TEXT,
-            search_count INTEGER DEFAULT 1,
-            last_searched TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(make, model)
-        )
-    ''')
-    
-    # Deal scores
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS deal_scores (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            listing_id INTEGER NOT NULL,
-            market_price_estimate INTEGER,
-            deal_score REAL,
-            quality_indicators TEXT,
-            calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (listing_id) REFERENCES car_listings (id)
-        )
-    ''')
-    
-    # Notifications
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS notifications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            listing_id INTEGER NOT NULL,
-            notification_type TEXT DEFAULT 'push',
-            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (id),
-            FOREIGN KEY (listing_id) REFERENCES car_listings (id)
-        )
-    ''')
-    
-    # Add new columns if they don't exist
-    columns_to_add = [
-        ("car_searches", "distance_miles", "INTEGER DEFAULT 25"),
-        ("car_listings", "deal_score", "REAL"),
-        ("users", "apple_receipt_data", "TEXT"),
-        ("users", "apple_original_transaction_id", "TEXT"),
-        ("users", "apple_latest_transaction_id", "TEXT"),
-        ("users", "apple_subscription_id", "TEXT")
-    ]
-    
-    for table, column, definition in columns_to_add:
-        try:
-            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-            print(f"✅ Added {column} column to {table} table")
-        except sqlite3.OperationalError:
-            pass
-    
-    conn.commit()
-    conn.close()
 
 # Pydantic Models
 class UserRegister(BaseModel):
@@ -579,13 +379,11 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 
 def get_user_subscription_tier(user_id: int) -> str:
     """Get user's current subscription tier"""
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT subscription_tier FROM users WHERE id = ?", (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    
+    result = execute_query(
+        "SELECT subscription_tier FROM users WHERE id = %s",
+        (user_id,),
+        fetch_one=True
+    )
     return result[0] if result else 'free'
 
 def get_subscription_limits(tier: str) -> dict:
@@ -692,114 +490,108 @@ def get_mock_cars(search_config):
 
 def enhanced_save_car_listings(search_id: int, cars: list):
     """Save car listings with value estimates and deal scoring"""
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    
-    # Get search details
-    cursor.execute("SELECT make, model, location FROM car_searches WHERE id = ?", (search_id,))
-    search_info = cursor.fetchone()
-    search_make = search_info[0] if search_info else None
-    search_model = search_info[1] if search_info else None
-    
-    for car in cars:
-        # Add make/model from search if not in car data
-        if not car.get('make') and search_make:
-            car['make'] = search_make
-        if not car.get('model') and search_model:
-            car['model'] = search_model
+    with get_db_cursor() as cursor:
+        # Get search details
+        cursor.execute("SELECT make, model, location FROM car_searches WHERE id = %s", (search_id,))
+        search_info = cursor.fetchone()
+        search_make = search_info[0] if search_info else None
+        search_model = search_info[1] if search_info else None
+        
+        for car in cars:
+            # Add make/model from search if not in car data
+            if not car.get('make') and search_make:
+                car['make'] = search_make
+            if not car.get('model') and search_model:
+                car['model'] = search_model
+                
+            # Enhance with value estimates
+            car = enhance_car_listing_with_values(car, value_estimator)
             
-        # Enhance with value estimates
-        car = enhance_car_listing_with_values(car, value_estimator)
-        
-        # Insert car listing
-        cursor.execute("""
-            INSERT INTO car_listings 
-            (search_id, title, price, year, mileage, url, fuel_type, transmission, 
-             body_style, color, deal_score)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            search_id,
-            car['title'],
-            car['price'],
-            car.get('year'),
-            car.get('mileage'),
-            car.get('url'),
-            car.get('fuel_type'),
-            car.get('transmission'),
-            car.get('body_style'),
-            car.get('color'),
-            car.get('deal_score', {}).get('score') if car.get('has_analysis') else None
-        ))
-        
-        listing_id = cursor.lastrowid
-        
-        # Save value estimate data if available
-        if car.get('has_analysis') and car.get('value_estimate'):
+            # Insert car listing
             cursor.execute("""
-                INSERT INTO deal_scores 
-                (listing_id, market_price_estimate, deal_score, quality_indicators, calculated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO car_listings 
+                (search_id, title, price, year, mileage, url, fuel_type, transmission, 
+                 body_style, color, deal_score)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
             """, (
-                listing_id,
-                car['value_estimate']['values']['private_party'],
-                car['deal_score']['score'],
-                json.dumps({
-                    'value_estimate': car['value_estimate'],
-                    'deal_score': car['deal_score']
-                }),
-                datetime.now().isoformat()
+                search_id,
+                car['title'],
+                car['price'],
+                car.get('year'),
+                car.get('mileage'),
+                car.get('url'),
+                car.get('fuel_type'),
+                car.get('transmission'),
+                car.get('body_style'),
+                car.get('color'),
+                car.get('deal_score', {}).get('score') if car.get('has_analysis') else None
             ))
-        
-        # Add to price history
-        try:
-            price_text = car['price'].replace('$', '').replace(',', '')
-            price_num = int(price_text) if price_text.isdigit() else None
             
-            year_text = car.get('year', '')
-            year_num = int(year_text) if str(year_text).isdigit() else None
+            listing_id = cursor.fetchone()[0]
             
-            mileage_text = str(car.get('mileage', '')).replace(',', '').replace(' miles', '')
-            mileage_num = int(mileage_text) if mileage_text.isdigit() else None
-            
-            if search_info and price_num:
+            # Save value estimate data if available
+            if car.get('has_analysis') and car.get('value_estimate'):
                 cursor.execute("""
-                    INSERT INTO price_history (make, model, year, location, price, mileage)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (search_make, search_model, year_num, search_info[2], price_num, mileage_num))
-        except Exception as e:
-            print(f"Error saving price history: {e}")
-    
-    conn.commit()
-    conn.close()
+                    INSERT INTO deal_scores 
+                    (listing_id, market_price_estimate, deal_score, quality_indicators, calculated_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (
+                    listing_id,
+                    car['value_estimate']['values']['private_party'],
+                    car['deal_score']['score'],
+                    json.dumps({
+                        'value_estimate': car['value_estimate'],
+                        'deal_score': car['deal_score']
+                    }),
+                    datetime.now().isoformat()
+                ))
+            
+            # Add to price history
+            try:
+                price_text = car['price'].replace('$', '').replace(',', '')
+                price_num = int(price_text) if price_text.isdigit() else None
+                
+                year_text = car.get('year', '')
+                year_num = int(year_text) if str(year_text).isdigit() else None
+                
+                mileage_text = str(car.get('mileage', '')).replace(',', '').replace(' miles', '')
+                mileage_num = int(mileage_text) if mileage_text.isdigit() else None
+                
+                if search_info and price_num:
+                    cursor.execute("""
+                        INSERT INTO price_history (make, model, year, location, price, mileage)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (search_make, search_model, year_num, search_info[2], price_num, mileage_num))
+            except Exception as e:
+                print(f"Error saving price history: {e}")
 
 def update_search_suggestions():
     """Update search suggestions based on current searches"""
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT make, model, COUNT(*) as count
-        FROM car_searches 
-        WHERE make IS NOT NULL OR model IS NOT NULL
-        GROUP BY make, model
-    """)
-    
-    suggestions = cursor.fetchall()
-    
-    for make, model, count in suggestions:
-        if make and model:
-            cursor.execute("""
-                INSERT OR REPLACE INTO search_suggestions (make, model, search_count)
-                VALUES (?, ?, ?)
-            """, (make, model, count))
-        elif make:
-            cursor.execute("""
-                INSERT OR REPLACE INTO search_suggestions (make, search_count)
-                VALUES (?, ?)
-            """, (make, count))
-    
-    conn.commit()
-    conn.close()
+    with get_db_cursor() as cursor:
+        cursor.execute("""
+            SELECT make, model, COUNT(*) as count
+            FROM car_searches 
+            WHERE make IS NOT NULL OR model IS NOT NULL
+            GROUP BY make, model
+        """)
+        
+        suggestions = cursor.fetchall()
+        
+        for make, model, count in suggestions:
+            if make and model:
+                cursor.execute("""
+                    INSERT INTO search_suggestions (make, model, search_count)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (make, model) DO UPDATE SET search_count = %s
+                """, (make, model, count, count))
+            elif make:
+                cursor.execute("""
+                    INSERT INTO search_suggestions (make, search_count)
+                    VALUES (%s, %s)
+                    ON CONFLICT (make) DO UPDATE SET search_count = %s
+                    WHERE model IS NULL
+                """, (make, count, count))
 
 # Background monitoring
 def run_continuous_monitoring():
@@ -809,7 +601,7 @@ def run_continuous_monitoring():
     # Initialize monitor
     if car_monitor is None:
         if ENHANCED_SCRAPER_AVAILABLE:
-            car_monitor = EnhancedCarSearchMonitor(use_selenium=False, use_mock_data=USE_MOCK_DATA)
+            car_monitor = EnhancedCarSearchMonitor(use_selenium=USE_SELENIUM, use_mock_data=USE_MOCK_DATA)
         else:
             car_monitor = CarSearchMonitor()
     
@@ -819,89 +611,85 @@ def run_continuous_monitoring():
     
     while True:
         try:
-            conn = sqlite3.connect(DATABASE)
-            cursor = conn.cursor()
-            
-            # Check total searches first
-            cursor.execute("SELECT COUNT(*) FROM car_searches WHERE is_active = TRUE")
-            total_searches = cursor.fetchone()[0]
-            print(f"📊 Total active searches in database: {total_searches}")
-            
-            if total_searches == 0:
-                print("⚠️  No active searches found - users need to create searches first!")
-            
-            # Process searches by tier
-            for tier, limits in SUBSCRIPTION_LIMITS.items():
-                tier_conditions = [tier]
-                if tier == 'pro':
-                    tier_conditions.append('pro_yearly')
-                elif tier == 'premium':
-                    tier_conditions.append('premium_yearly')
+            with get_db_cursor() as cursor:
+                # Check total searches first
+                cursor.execute("SELECT COUNT(*) FROM car_searches WHERE is_active = TRUE")
+                total_searches = cursor.fetchone()[0]
+                print(f"📊 Total active searches in database: {total_searches}")
                 
-                placeholders = ','.join(['?' for _ in tier_conditions])
+                if total_searches == 0:
+                    print("⚠️  No active searches found - users need to create searches first!")
                 
-                cursor.execute(f"""
-                    SELECT cs.id, cs.make, cs.model, cs.year_min, cs.year_max, 
-                           cs.price_min, cs.price_max, cs.mileage_max, cs.location,
-                           cs.distance_miles, u.subscription_tier, u.email, u.id
-                    FROM car_searches cs
-                    JOIN users u ON cs.user_id = u.id 
-                    WHERE cs.is_active = TRUE AND u.subscription_tier IN ({placeholders})
-                """, tier_conditions)
-                
-                tier_searches = cursor.fetchall()
-                print(f"🔍 Found {len(tier_searches)} searches for tier: {tier}")
-                
-                if tier_searches:
-                    print(f"🔄 Processing {len(tier_searches)} {tier.upper()} searches")
+                # Process searches by tier
+                for tier, limits in SUBSCRIPTION_LIMITS.items():
+                    tier_conditions = [tier]
+                    if tier == 'pro':
+                        tier_conditions.append('pro_yearly')
+                    elif tier == 'premium':
+                        tier_conditions.append('premium_yearly')
                     
-                    for search_row in tier_searches:
-                        search_id = search_row[0]
-                        user_id = search_row[12]
+                    placeholders = ','.join(['%s' for _ in tier_conditions])
+                    
+                    cursor.execute(f"""
+                        SELECT cs.id, cs.make, cs.model, cs.year_min, cs.year_max, 
+                               cs.price_min, cs.price_max, cs.mileage_max, cs.location,
+                               cs.distance_miles, u.subscription_tier, u.email, u.id
+                        FROM car_searches cs
+                        JOIN users u ON cs.user_id = u.id 
+                        WHERE cs.is_active = TRUE AND u.subscription_tier IN ({placeholders})
+                    """, tier_conditions)
+                    
+                    tier_searches = cursor.fetchall()
+                    print(f"🔍 Found {len(tier_searches)} searches for tier: {tier}")
+                    
+                    if tier_searches:
+                        print(f"🔄 Processing {len(tier_searches)} {tier.upper()} searches")
                         
-                        # Get location info
-                        location_info = get_location_info(search_row[8])
-                        
-                        search_config = {
-                            'make': search_row[1],
-                            'model': search_row[2],
-                            'year_min': search_row[3],
-                            'year_max': search_row[4],
-                            'price_min': search_row[5],
-                            'price_max': search_row[6],
-                            'mileage_max': search_row[7],
-                            'location': search_row[8] or 'Miami, FL',
-                            'distance_miles': search_row[9],
-                            'lat': location_info['lat'],
-                            'lng': location_info['lng'],
-                            'fb_location_id': location_info['fb_id']
-                        }
-                        
-                        try:
-                            new_cars = car_monitor.monitor_car_search(search_config)
+                        for search_row in tier_searches:
+                            search_id = search_row[0]
+                            user_id = search_row[12]
                             
-                            # Use mock data if enabled and no real results
-                            if not new_cars and USE_MOCK_DATA:
-                                print("📊 Using mock data for testing")
-                                new_cars = get_mock_cars(search_config)
+                            # Get location info
+                            location_info = get_location_info(search_row[8])
                             
-                            if new_cars:
-                                enhanced_save_car_listings(search_id, new_cars)
+                            search_config = {
+                                'make': search_row[1],
+                                'model': search_row[2],
+                                'year_min': search_row[3],
+                                'year_max': search_row[4],
+                                'price_min': search_row[5],
+                                'price_max': search_row[6],
+                                'mileage_max': search_row[7],
+                                'location': search_row[8] or 'Miami, FL',
+                                'distance_miles': search_row[9],
+                                'lat': location_info['lat'],
+                                'lng': location_info['lng'],
+                                'fb_location_id': location_info['fb_id']
+                            }
+                            
+                            try:
+                                new_cars = car_monitor.monitor_car_search(search_config)
                                 
-                                search_name = f"{search_config.get('make', '')} {search_config.get('model', '')}".strip()
-                                print(f"🚗 Found {len(new_cars)} new {search_name} cars!")
+                                # Use mock data if enabled and no real results
+                                if not new_cars and USE_MOCK_DATA:
+                                    print("📊 Using mock data for testing")
+                                    new_cars = get_mock_cars(search_config)
                                 
-                                if new_cars and new_cars[0].get('deal_score'):
-                                    print(f"   Best deal: {new_cars[0]['deal_score']['rating']}")
-                        
-                        except Exception as e:
-                            print(f"❌ Error monitoring search {search_id}: {e}")
-                        
-                        time.sleep(3)
-                
-                time.sleep(5)
-            
-            conn.close()
+                                if new_cars:
+                                    enhanced_save_car_listings(search_id, new_cars)
+                                    
+                                    search_name = f"{search_config.get('make', '')} {search_config.get('model', '')}".strip()
+                                    print(f"🚗 Found {len(new_cars)} new {search_name} cars!")
+                                    
+                                    if new_cars and new_cars[0].get('deal_score'):
+                                        print(f"   Best deal: {new_cars[0]['deal_score']['rating']}")
+                            
+                            except Exception as e:
+                                print(f"❌ Error monitoring search {search_id}: {e}")
+                            
+                            time.sleep(3)
+                    
+                    time.sleep(5)
             
             update_search_suggestions()
             
@@ -1007,16 +795,13 @@ async def get_pricing():
 @app.post("/register")
 async def register(user: UserRegister):
     """Free registration"""
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    
     try:
-        cursor.execute(
-            "INSERT INTO users (email, password_hash, subscription_tier) VALUES (?, ?, ?)",
-            (user.email, hash_password(user.password), 'free')
+        user_id = execute_insert(
+            "INSERT INTO users (email, password_hash, subscription_tier) VALUES (%s, %s, %s)",
+            (user.email, hash_password(user.password), 'free'),
+            returning_id=True
         )
-        conn.commit()
-        user_id = cursor.lastrowid
+        
         token = create_token(user_id)
         
         return {
@@ -1026,22 +811,17 @@ async def register(user: UserRegister):
             "message": "Welcome to Flippit! You can search within 25 miles. Upgrade to Pro for 50 miles or Premium for 200 miles!"
         }
     
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         raise HTTPException(status_code=400, detail="Email already registered")
-    finally:
-        conn.close()
 
 @app.post("/login")
 async def login(user: UserLogin):
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT id, password_hash, subscription_tier 
-        FROM users WHERE email = ?
-    """, (user.email,))
-    db_user = cursor.fetchone()
-    conn.close()
+    with get_db_cursor() as cursor:
+        cursor.execute("""
+            SELECT id, password_hash, subscription_tier 
+            FROM users WHERE email = %s
+        """, (user.email,))
+        db_user = cursor.fetchone()
     
     if not db_user or not verify_password(user.password, db_user[1]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -1088,47 +868,45 @@ async def verify_purchase(receipt: AppleReceiptVerification, user_id: int = Depe
         subscription_tier = get_subscription_tier_from_product_id(receipt.product_id)
         
         # Update user subscription
-        conn = sqlite3.connect(DATABASE)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            UPDATE users SET 
-                subscription_tier = ?,
-                subscription_expires = ?,
-                apple_receipt_data = ?,
-                apple_original_transaction_id = ?,
-                apple_latest_transaction_id = ?,
-                apple_subscription_id = ?
-            WHERE id = ?
-        """, (
-            subscription_tier,
-            purchase_info['expires_date'],
-            receipt.receipt_data,
-            purchase_info['original_transaction_id'],
-            purchase_info['transaction_id'],
-            receipt.product_id,
-            user_id
-        ))
-        
-        # Save receipt record
-        cursor.execute("""
-            INSERT OR REPLACE INTO apple_receipts 
-            (user_id, receipt_data, transaction_id, original_transaction_id, 
-             product_id, purchase_date, expires_date, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            user_id,
-            receipt.receipt_data,
-            purchase_info['transaction_id'],
-            purchase_info['original_transaction_id'],
-            receipt.product_id,
-            purchase_info['purchase_date'],
-            purchase_info['expires_date'],
-            purchase_info['is_active']
-        ))
-        
-        conn.commit()
-        conn.close()
+        with get_db_cursor() as cursor:
+            cursor.execute("""
+                UPDATE users SET 
+                    subscription_tier = %s,
+                    subscription_expires = %s,
+                    apple_receipt_data = %s,
+                    apple_original_transaction_id = %s,
+                    apple_latest_transaction_id = %s,
+                    apple_subscription_id = %s
+                WHERE id = %s
+            """, (
+                subscription_tier,
+                purchase_info['expires_date'],
+                receipt.receipt_data,
+                purchase_info['original_transaction_id'],
+                purchase_info['transaction_id'],
+                receipt.product_id,
+                user_id
+            ))
+            
+            # Save receipt record
+            cursor.execute("""
+                INSERT INTO apple_receipts 
+                (user_id, receipt_data, transaction_id, original_transaction_id, 
+                 product_id, purchase_date, expires_date, is_active)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (transaction_id) DO UPDATE SET
+                    expires_date = EXCLUDED.expires_date,
+                    is_active = EXCLUDED.is_active
+            """, (
+                user_id,
+                receipt.receipt_data,
+                purchase_info['transaction_id'],
+                purchase_info['original_transaction_id'],
+                receipt.product_id,
+                purchase_info['purchase_date'],
+                purchase_info['expires_date'],
+                purchase_info['is_active']
+            ))
         
         product_info = IAP_PRODUCTS.get(receipt.product_id, {})
         
@@ -1186,30 +964,25 @@ async def restore_purchases(receipt: AppleReceiptVerification, user_id: int = De
         # Restore the subscription
         subscription_tier = get_subscription_tier_from_product_id(active_subscription['product_id'])
         
-        conn = sqlite3.connect(DATABASE)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            UPDATE users SET 
-                subscription_tier = ?,
-                subscription_expires = ?,
-                apple_receipt_data = ?,
-                apple_original_transaction_id = ?,
-                apple_latest_transaction_id = ?,
-                apple_subscription_id = ?
-            WHERE id = ?
-        """, (
-            subscription_tier,
-            active_subscription['expires_date'],
-            receipt.receipt_data,
-            active_subscription['original_transaction_id'],
-            active_subscription['transaction_id'],
-            active_subscription['product_id'],
-            user_id
-        ))
-        
-        conn.commit()
-        conn.close()
+        with get_db_cursor() as cursor:
+            cursor.execute("""
+                UPDATE users SET 
+                    subscription_tier = %s,
+                    subscription_expires = %s,
+                    apple_receipt_data = %s,
+                    apple_original_transaction_id = %s,
+                    apple_latest_transaction_id = %s,
+                    apple_subscription_id = %s
+                WHERE id = %s
+            """, (
+                subscription_tier,
+                active_subscription['expires_date'],
+                receipt.receipt_data,
+                active_subscription['original_transaction_id'],
+                active_subscription['transaction_id'],
+                active_subscription['product_id'],
+                user_id
+            ))
         
         product_info = IAP_PRODUCTS.get(active_subscription['product_id'], {})
         
@@ -1269,49 +1042,43 @@ async def get_subscription(request: Request):
             }
         
         # Get user's actual subscription
-        conn = sqlite3.connect(DATABASE)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT subscription_tier, subscription_expires, trial_ends, gifted_by 
-            FROM users WHERE id = ?
-        """, (user_id,))
-        result = cursor.fetchone()
-        
-        if not result:
-            conn.close()
-            # Return default instead of 404
-            return {
-                "tier": "free",
-                "max_searches": 3,
-                "current_searches": 0,
-                "interval_minutes": 25,
-                "max_distance_miles": 25,
-                "features": ["basic_search", "value_estimates", "25_mile_radius"],
-                "price": "$0/month",
-                "trial_ends": None,
-                "gifted_by": None,
-                "platform": "ios"
-            }
-        
-        tier, subscription_expires, trial_ends, gifted_by = result
-        
-        # Check if subscription has expired
-        if subscription_expires:
-            expires_date = datetime.fromisoformat(subscription_expires.replace('Z', '+00:00'))
-            if expires_date < datetime.now(timezone.utc):
-                # Subscription expired, downgrade to free
-                cursor.execute("UPDATE users SET subscription_tier = 'free' WHERE id = ?", (user_id,))
-                conn.commit()
-                tier = 'free'
-        
-        limits = get_subscription_limits(tier)
-        
-        # Count current searches
-        cursor.execute("SELECT COUNT(*) FROM car_searches WHERE user_id = ? AND is_active = TRUE", (user_id,))
-        current_searches = cursor.fetchone()[0]
-        
-        conn.close()
+        with get_db_cursor() as cursor:
+            cursor.execute("""
+                SELECT subscription_tier, subscription_expires, trial_ends, gifted_by 
+                FROM users WHERE id = %s
+            """, (user_id,))
+            result = cursor.fetchone()
+            
+            if not result:
+                # Return default instead of 404
+                return {
+                    "tier": "free",
+                    "max_searches": 3,
+                    "current_searches": 0,
+                    "interval_minutes": 25,
+                    "max_distance_miles": 25,
+                    "features": ["basic_search", "value_estimates", "25_mile_radius"],
+                    "price": "$0/month",
+                    "trial_ends": None,
+                    "gifted_by": None,
+                    "platform": "ios"
+                }
+            
+            tier, subscription_expires, trial_ends, gifted_by = result
+            
+            # Check if subscription has expired
+            if subscription_expires:
+                expires_date = datetime.fromisoformat(subscription_expires.replace('Z', '+00:00'))
+                if expires_date < datetime.now(timezone.utc):
+                    # Subscription expired, downgrade to free
+                    cursor.execute("UPDATE users SET subscription_tier = 'free' WHERE id = %s", (user_id,))
+                    tier = 'free'
+            
+            limits = get_subscription_limits(tier)
+            
+            # Count current searches
+            cursor.execute("SELECT COUNT(*) FROM car_searches WHERE user_id = %s AND is_active = TRUE", (user_id,))
+            current_searches = cursor.fetchone()[0]
         
         # Get display price for current tier
         display_prices = {
@@ -1355,93 +1122,83 @@ async def get_subscription(request: Request):
 @app.post("/car-searches", response_model=CarSearchResponse)
 async def create_car_search(search: CarSearchCreate, user_id: int = Depends(verify_token)):
     print(f"🎯 Creating new search for user {user_id}")
-    print(f"   Search details: {search.dict()}")
+    print(f"   Search details: {search.model_dump()}")
     
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    
-    # Get user's subscription
-    tier = get_user_subscription_tier(user_id)
-    limits = get_subscription_limits(tier)
-    
-    print(f"   User tier: {tier}, Max searches: {limits['max_searches']}")
-    
-    # Check search count
-    cursor.execute("SELECT COUNT(*) FROM car_searches WHERE user_id = ? AND is_active = TRUE", (user_id,))
-    current_count = cursor.fetchone()[0]
-    
-    print(f"   Current search count: {current_count}")
-    
-    if current_count >= limits['max_searches']:
-        print(f"❌ Search limit reached for user {user_id}")
-        raise HTTPException(
-            status_code=403,
-            detail=f"Search limit reached! {tier} tier allows {limits['max_searches']} searches."
-        )
-    
-    # Set distance based on subscription or use provided value if within limits
-    if search.distance_miles:
-        if search.distance_miles > limits['max_distance_miles']:
-            print(f"❌ Distance limit exceeded: {search.distance_miles} > {limits['max_distance_miles']}")
+    with get_db_cursor() as cursor:
+        # Get user's subscription
+        tier = get_user_subscription_tier(user_id)
+        limits = get_subscription_limits(tier)
+        
+        print(f"   User tier: {tier}, Max searches: {limits['max_searches']}")
+        
+        # Check search count
+        cursor.execute("SELECT COUNT(*) FROM car_searches WHERE user_id = %s AND is_active = TRUE", (user_id,))
+        current_count = cursor.fetchone()[0]
+        
+        print(f"   Current search count: {current_count}")
+        
+        if current_count >= limits['max_searches']:
+            print(f"❌ Search limit reached for user {user_id}")
             raise HTTPException(
                 status_code=403,
-                detail=f"{tier} tier allows searches up to {limits['max_distance_miles']} miles. Upgrade for wider search!"
+                detail=f"Search limit reached! {tier} tier allows {limits['max_searches']} searches."
             )
-        distance = search.distance_miles
-    else:
-        distance = limits['max_distance_miles']
-    
-    print(f"   Using distance: {distance} miles")
-    
-    # Validate year ranges
-    if search.year_min and search.year_min < MIN_CAR_YEAR:
-        search.year_min = MIN_CAR_YEAR
-    if search.year_max and search.year_max > DEFAULT_MAX_YEAR:
-        search.year_max = DEFAULT_MAX_YEAR
-    
-    # Create the search
-    cursor.execute(
-        """INSERT INTO car_searches 
-           (user_id, make, model, year_min, year_max, price_min, price_max, 
-            mileage_max, location, distance_miles) 
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (user_id, search.make, search.model, search.year_min, search.year_max,
-         search.price_min, search.price_max, search.mileage_max, search.location, distance)
-    )
-    
-    search_id = cursor.lastrowid
-    conn.commit()
-    
-    print(f"✅ Created search with ID: {search_id}")
-    
-    # Get the created search
-    cursor.execute("SELECT * FROM car_searches WHERE id = ?", (search_id,))
-    row = cursor.fetchone()
-    
-    print(f"   Retrieved search: {row}")
-    
-    conn.close()
+        
+        # Set distance based on subscription or use provided value if within limits
+        if search.distance_miles:
+            if search.distance_miles > limits['max_distance_miles']:
+                print(f"❌ Distance limit exceeded: {search.distance_miles} > {limits['max_distance_miles']}")
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"{tier} tier allows searches up to {limits['max_distance_miles']} miles. Upgrade for wider search!"
+                )
+            distance = search.distance_miles
+        else:
+            distance = limits['max_distance_miles']
+        
+        print(f"   Using distance: {distance} miles")
+        
+        # Validate year ranges
+        if search.year_min and search.year_min < MIN_CAR_YEAR:
+            search.year_min = MIN_CAR_YEAR
+        if search.year_max and search.year_max > DEFAULT_MAX_YEAR:
+            search.year_max = DEFAULT_MAX_YEAR
+        
+        # Create the search
+        cursor.execute(
+            """INSERT INTO car_searches 
+               (user_id, make, model, year_min, year_max, price_min, price_max, 
+                mileage_max, location, distance_miles) 
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+               RETURNING id, created_at, is_active""",
+            (user_id, search.make, search.model, search.year_min, search.year_max,
+             search.price_min, search.price_max, search.mileage_max, search.location, distance)
+        )
+        
+        result = cursor.fetchone()
+        search_id = result[0]
+        created_at = result[1]
+        is_active = result[2]
+        
+        print(f"✅ Created search with ID: {search_id}")
     
     if search.make or search.model:
         update_search_suggestions()
     
-    result = CarSearchResponse(
-        id=row[0],
-        make=row[2],
-        model=row[3],
-        year_min=row[4],
-        year_max=row[5],
-        price_min=row[6],
-        price_max=row[7],
-        mileage_max=row[8],
-        location=row[9],
-        distance_miles=row[10],
-        is_active=row[11],
-        created_at=row[12]
+    return CarSearchResponse(
+        id=search_id,
+        make=search.make,
+        model=search.model,
+        year_min=search.year_min,
+        year_max=search.year_max,
+        price_min=search.price_min,
+        price_max=search.price_max,
+        mileage_max=search.mileage_max,
+        location=search.location,
+        distance_miles=distance,
+        is_active=is_active,
+        created_at=created_at.isoformat()
     )
-    
-    print(f"🎉 Returning search: {result.dict()}")
-    return result
 
 @app.get("/search-defaults")
 async def get_search_defaults(user_id: int = Depends(verify_token)):
@@ -1501,33 +1258,29 @@ async def debug_searches(request: Request):
             except Exception as e:
                 print(f"Token error in debug: {e}")
         
-        conn = sqlite3.connect(DATABASE)
-        cursor = conn.cursor()
-        
-        # Get all users
-        cursor.execute("SELECT id, email, subscription_tier FROM users")
-        all_users = cursor.fetchall()
-        
-        # Get all searches
-        cursor.execute("""
-            SELECT cs.id, cs.user_id, cs.make, cs.model, cs.is_active, cs.created_at, u.email
-            FROM car_searches cs
-            LEFT JOIN users u ON cs.user_id = u.id
-            ORDER BY cs.created_at DESC
-        """)
-        all_searches = cursor.fetchall()
-        
-        # Get searches for current user if authenticated
-        user_searches = []
-        if user_id:
+        with get_db_cursor() as cursor:
+            # Get all users
+            cursor.execute("SELECT id, email, subscription_tier FROM users")
+            all_users = cursor.fetchall()
+            
+            # Get all searches
             cursor.execute("""
-                SELECT * FROM car_searches 
-                WHERE user_id = ? 
-                ORDER BY created_at DESC
-            """, (user_id,))
-            user_searches = cursor.fetchall()
-        
-        conn.close()
+                SELECT cs.id, cs.user_id, cs.make, cs.model, cs.is_active, cs.created_at, u.email
+                FROM car_searches cs
+                LEFT JOIN users u ON cs.user_id = u.id
+                ORDER BY cs.created_at DESC
+            """)
+            all_searches = cursor.fetchall()
+            
+            # Get searches for current user if authenticated
+            user_searches = []
+            if user_id:
+                cursor.execute("""
+                    SELECT * FROM car_searches 
+                    WHERE user_id = %s 
+                    ORDER BY created_at DESC
+                """, (user_id,))
+                user_searches = cursor.fetchall()
         
         return {
             "authenticated_user_id": user_id,
@@ -1542,7 +1295,7 @@ async def debug_searches(request: Request):
                     "make": s[2],
                     "model": s[3],
                     "is_active": s[4],
-                    "created_at": s[5],
+                    "created_at": s[5].isoformat() if s[5] else None,
                     "user_email": s[6]
                 } for s in all_searches
             ],
@@ -1563,17 +1316,13 @@ async def debug_searches(request: Request):
 async def get_car_searches(user_id: int = Depends(verify_token)):
     print(f"🔍 Getting car searches for user {user_id}")
     
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT * FROM car_searches WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
-    rows = cursor.fetchall()
-    
-    print(f"📊 Found {len(rows)} searches for user {user_id}")
-    for i, row in enumerate(rows):
-        print(f"   Search {i+1}: ID={row[0]}, Make={row[2]}, Model={row[3]}, Active={row[11] if len(row) > 11 else 'unknown'}")
-    
-    conn.close()
+    with get_db_cursor() as cursor:
+        cursor.execute("SELECT * FROM car_searches WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
+        rows = cursor.fetchall()
+        
+        print(f"📊 Found {len(rows)} searches for user {user_id}")
+        for i, row in enumerate(rows):
+            print(f"   Search {i+1}: ID={row[0]}, Make={row[2]}, Model={row[3]}, Active={row[11] if len(row) > 11 else 'unknown'}")
     
     searches = []
     for row in rows:
@@ -1590,7 +1339,7 @@ async def get_car_searches(user_id: int = Depends(verify_token)):
                 location=row[9],
                 distance_miles=row[10] if len(row) > 10 else 25,
                 is_active=row[11] if len(row) > 11 else True,
-                created_at=row[12] if len(row) > 12 else ""
+                created_at=row[12].isoformat() if len(row) > 12 else ""
             )
             searches.append(search)
         except Exception as e:
@@ -1602,88 +1351,76 @@ async def get_car_searches(user_id: int = Depends(verify_token)):
 @app.put("/car-searches/{search_id}")
 async def update_car_search(search_id: int, search: CarSearchUpdate, user_id: int = Depends(verify_token)):
     """Update existing car search"""
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    
-    # Verify ownership
-    cursor.execute("SELECT user_id FROM car_searches WHERE id = ?", (search_id,))
-    search_owner = cursor.fetchone()
-    
-    if not search_owner or search_owner[0] != user_id:
-        raise HTTPException(status_code=404, detail="Search not found")
-    
-    # Check distance limits if updating
-    if search.distance_miles:
-        tier = get_user_subscription_tier(user_id)
-        limits = get_subscription_limits(tier)
+    with get_db_cursor() as cursor:
+        # Verify ownership
+        cursor.execute("SELECT user_id FROM car_searches WHERE id = %s", (search_id,))
+        search_owner = cursor.fetchone()
         
-        if search.distance_miles > limits['max_distance_miles']:
-            raise HTTPException(
-                status_code=403,
-                detail=f"{tier} tier allows searches up to {limits['max_distance_miles']} miles."
-            )
-    
-    # Build update query
-    update_fields = []
-    values = []
-    
-    for field, value in search.dict(exclude_unset=True).items():
-        update_fields.append(f"{field} = ?")
-        values.append(value)
-    
-    if update_fields:
-        values.append(search_id)
-        cursor.execute(f"""
-            UPDATE car_searches 
-            SET {', '.join(update_fields)}
-            WHERE id = ?
-        """, values)
+        if not search_owner or search_owner[0] != user_id:
+            raise HTTPException(status_code=404, detail="Search not found")
         
-        conn.commit()
+        # Check distance limits if updating
+        if search.distance_miles:
+            tier = get_user_subscription_tier(user_id)
+            limits = get_subscription_limits(tier)
+            
+            if search.distance_miles > limits['max_distance_miles']:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"{tier} tier allows searches up to {limits['max_distance_miles']} miles."
+                )
+        
+        # Build update query
+        update_fields = []
+        values = []
+        
+        for field, value in search.model_dump(exclude_unset=True).items():
+            update_fields.append(f"{field} = %s")
+            values.append(value)
+        
+        if update_fields:
+            values.append(search_id)
+            cursor.execute(f"""
+                UPDATE car_searches 
+                SET {', '.join(update_fields)}
+                WHERE id = %s
+            """, values)
     
-    conn.close()
     return {"message": "Search updated successfully"}
 
 @app.delete("/car-searches/{search_id}")
 async def delete_car_search(search_id: int, user_id: int = Depends(verify_token)):
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT user_id FROM car_searches WHERE id = ?", (search_id,))
-    search = cursor.fetchone()
-    
-    if not search or search[0] != user_id:
-        raise HTTPException(status_code=404, detail="Search not found")
-    
-    cursor.execute("DELETE FROM car_searches WHERE id = ?", (search_id,))
-    conn.commit()
-    conn.close()
+    with get_db_cursor() as cursor:
+        cursor.execute("SELECT user_id FROM car_searches WHERE id = %s", (search_id,))
+        search = cursor.fetchone()
+        
+        if not search or search[0] != user_id:
+            raise HTTPException(status_code=404, detail="Search not found")
+        
+        cursor.execute("DELETE FROM car_searches WHERE id = %s", (search_id,))
     
     return {"message": "Car search deleted successfully"}
 
 @app.get("/all-deals")
 async def get_all_deals(user_id: int = Depends(verify_token)):
     """Get all found cars with value analysis"""
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    
     try:
-        cursor.execute("""
-            SELECT 
-                cl.id, cl.search_id, cl.title, cl.price, cl.year, cl.mileage,
-                cl.url, cl.found_at, cl.fuel_type, cl.transmission, cl.deal_score,
-                cs.make, cs.model,
-                ds.quality_indicators
-            FROM car_listings cl
-            JOIN car_searches cs ON cl.search_id = cs.id
-            LEFT JOIN deal_scores ds ON cl.id = ds.listing_id
-            WHERE cs.user_id = ?
-            ORDER BY cl.found_at DESC
-            LIMIT 100
-        """, (user_id,))
-        
-        rows = cursor.fetchall()
-        conn.close()
+        with get_db_cursor() as cursor:
+            cursor.execute("""
+                SELECT 
+                    cl.id, cl.search_id, cl.title, cl.price, cl.year, cl.mileage,
+                    cl.url, cl.found_at, cl.fuel_type, cl.transmission, cl.deal_score,
+                    cs.make, cs.model,
+                    ds.quality_indicators
+                FROM car_listings cl
+                JOIN car_searches cs ON cl.search_id = cs.id
+                LEFT JOIN deal_scores ds ON cl.id = ds.listing_id
+                WHERE cs.user_id = %s
+                ORDER BY cl.found_at DESC
+                LIMIT 100
+            """, (user_id,))
+            
+            rows = cursor.fetchall()
         
         deals = []
         for row in rows:
@@ -1695,7 +1432,7 @@ async def get_all_deals(user_id: int = Depends(verify_token)):
                 "year": row[4],
                 "mileage": row[5],
                 "url": row[6],
-                "found_at": row[7],
+                "found_at": row[7].isoformat() if row[7] else None,
                 "fuel_type": row[8],
                 "transmission": row[9],
                 "deal_score_value": row[10],
@@ -1724,49 +1461,44 @@ async def get_all_deals(user_id: int = Depends(verify_token)):
         
     except Exception as e:
         print(f"Error in all-deals: {e}")
-        conn.close()
         return {"deals": [], "total": 0}
 
 @app.get("/force-search-cycle")
 async def force_search_cycle():
     """Manually trigger a search cycle for debugging"""
     try:
-        conn = sqlite3.connect(DATABASE)
-        cursor = conn.cursor()
-        
-        # Check total searches
-        cursor.execute("SELECT COUNT(*) FROM car_searches WHERE is_active = TRUE")
-        total_searches = cursor.fetchone()[0]
-        
-        if total_searches == 0:
-            return {"message": "No active searches found. Create a search first!", "total_searches": 0}
-        
-        # Get a sample search to test
-        cursor.execute("""
-            SELECT cs.id, cs.make, cs.model, cs.location, u.subscription_tier
-            FROM car_searches cs
-            JOIN users u ON cs.user_id = u.id 
-            WHERE cs.is_active = TRUE
-            LIMIT 1
-        """)
-        
-        search = cursor.fetchone()
-        if not search:
-            return {"message": "No valid search found", "total_searches": total_searches}
-        
-        search_id, make, model, location, tier = search
-        
-        # Force mock data for this search
-        search_config = {
-            'make': make or 'Toyota',
-            'model': model or 'Camry',
-            'location': location or 'Miami, FL'
-        }
-        
-        mock_cars = get_mock_cars(search_config)
-        enhanced_save_car_listings(search_id, mock_cars)
-        
-        conn.close()
+        with get_db_cursor() as cursor:
+            # Check total searches
+            cursor.execute("SELECT COUNT(*) FROM car_searches WHERE is_active = TRUE")
+            total_searches = cursor.fetchone()[0]
+            
+            if total_searches == 0:
+                return {"message": "No active searches found. Create a search first!", "total_searches": 0}
+            
+            # Get a sample search to test
+            cursor.execute("""
+                SELECT cs.id, cs.make, cs.model, cs.location, u.subscription_tier
+                FROM car_searches cs
+                JOIN users u ON cs.user_id = u.id 
+                WHERE cs.is_active = TRUE
+                LIMIT 1
+            """)
+            
+            search = cursor.fetchone()
+            if not search:
+                return {"message": "No valid search found", "total_searches": total_searches}
+            
+            search_id, make, model, location, tier = search
+            
+            # Force mock data for this search
+            search_config = {
+                'make': make or 'Toyota',
+                'model': model or 'Camry',
+                'location': location or 'Miami, FL'
+            }
+            
+            mock_cars = get_mock_cars(search_config)
+            enhanced_save_car_listings(search_id, mock_cars)
         
         return {
             "message": f"Successfully added {len(mock_cars)} mock cars to search {search_id}",
@@ -1785,25 +1517,21 @@ async def force_search_cycle():
 @app.delete("/clear-test-cars/{search_id}")
 async def clear_test_cars(search_id: int, user_id: int = Depends(verify_token)):
     """Clear all test/mock cars for a specific search"""
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    
-    # Verify ownership
-    cursor.execute("SELECT user_id FROM car_searches WHERE id = ?", (search_id,))
-    search_owner = cursor.fetchone()
-    
-    if not search_owner or search_owner[0] != user_id:
-        raise HTTPException(status_code=404, detail="Search not found")
-    
-    # Delete mock cars (ones with mock URLs)
-    cursor.execute("""
-        DELETE FROM car_listings 
-        WHERE search_id = ? AND (url LIKE '%mock%' OR url LIKE '%test%')
-    """, (search_id,))
-    
-    deleted_count = cursor.rowcount
-    conn.commit()
-    conn.close()
+    with get_db_cursor() as cursor:
+        # Verify ownership
+        cursor.execute("SELECT user_id FROM car_searches WHERE id = %s", (search_id,))
+        search_owner = cursor.fetchone()
+        
+        if not search_owner or search_owner[0] != user_id:
+            raise HTTPException(status_code=404, detail="Search not found")
+        
+        # Delete mock cars (ones with mock URLs)
+        cursor.execute("""
+            DELETE FROM car_listings 
+            WHERE search_id = %s AND (url LIKE '%mock%' OR url LIKE '%test%')
+        """, (search_id,))
+        
+        deleted_count = cursor.rowcount
     
     return {
         "message": f"Cleared {deleted_count} test cars from search {search_id}",
@@ -1813,27 +1541,22 @@ async def clear_test_cars(search_id: int, user_id: int = Depends(verify_token)):
 @app.delete("/clear-all-test-cars")
 async def clear_all_test_cars(user_id: int = Depends(verify_token)):
     """Clear ALL test/mock cars for the current user - ONE CLICK CLEANUP"""
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    
-    # Delete mock cars for all user's searches
-    cursor.execute("""
-        DELETE FROM car_listings 
-        WHERE search_id IN (
-            SELECT id FROM car_searches WHERE user_id = ?
-        ) AND (url LIKE '%mock%' OR url LIKE '%test%')
-    """, (user_id,))
-    
-    deleted_count = cursor.rowcount
-    
-    # Also clear associated deal scores for deleted listings
-    cursor.execute("""
-        DELETE FROM deal_scores 
-        WHERE listing_id NOT IN (SELECT id FROM car_listings)
-    """)
-    
-    conn.commit()
-    conn.close()
+    with get_db_cursor() as cursor:
+        # Delete mock cars for all user's searches
+        cursor.execute("""
+            DELETE FROM car_listings 
+            WHERE search_id IN (
+                SELECT id FROM car_searches WHERE user_id = %s
+            ) AND (url LIKE '%mock%' OR url LIKE '%test%')
+        """, (user_id,))
+        
+        deleted_count = cursor.rowcount
+        
+        # Also clear associated deal scores for deleted listings
+        cursor.execute("""
+            DELETE FROM deal_scores 
+            WHERE listing_id NOT IN (SELECT id FROM car_listings)
+        """)
     
     return {
         "success": True,
@@ -1845,41 +1568,37 @@ async def clear_all_test_cars(user_id: int = Depends(verify_token)):
 @app.get("/search-stats/{search_id}")
 async def get_search_stats(search_id: int, user_id: int = Depends(verify_token)):
     """Get statistics about a search including test vs real cars"""
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    
-    # Verify ownership
-    cursor.execute("SELECT user_id, make, model FROM car_searches WHERE id = ?", (search_id,))
-    search_info = cursor.fetchone()
-    
-    if not search_info or search_info[0] != user_id:
-        raise HTTPException(status_code=404, detail="Search not found")
-    
-    # Count total cars
-    cursor.execute("SELECT COUNT(*) FROM car_listings WHERE search_id = ?", (search_id,))
-    total_cars = cursor.fetchone()[0]
-    
-    # Count test cars
-    cursor.execute("""
-        SELECT COUNT(*) FROM car_listings 
-        WHERE search_id = ? AND (url LIKE '%mock%' OR url LIKE '%test%')
-    """, (search_id,))
-    test_cars = cursor.fetchone()[0]
-    
-    # Count real cars
-    real_cars = total_cars - test_cars
-    
-    # Get latest cars
-    cursor.execute("""
-        SELECT title, price, url, found_at 
-        FROM car_listings 
-        WHERE search_id = ? 
-        ORDER BY found_at DESC 
-        LIMIT 5
-    """, (search_id,))
-    latest_cars = cursor.fetchall()
-    
-    conn.close()
+    with get_db_cursor() as cursor:
+        # Verify ownership
+        cursor.execute("SELECT user_id, make, model FROM car_searches WHERE id = %s", (search_id,))
+        search_info = cursor.fetchone()
+        
+        if not search_info or search_info[0] != user_id:
+            raise HTTPException(status_code=404, detail="Search not found")
+        
+        # Count total cars
+        cursor.execute("SELECT COUNT(*) FROM car_listings WHERE search_id = %s", (search_id,))
+        total_cars = cursor.fetchone()[0]
+        
+        # Count test cars
+        cursor.execute("""
+            SELECT COUNT(*) FROM car_listings 
+            WHERE search_id = %s AND (url LIKE '%mock%' OR url LIKE '%test%')
+        """, (search_id,))
+        test_cars = cursor.fetchone()[0]
+        
+        # Count real cars
+        real_cars = total_cars - test_cars
+        
+        # Get latest cars
+        cursor.execute("""
+            SELECT title, price, url, found_at 
+            FROM car_listings 
+            WHERE search_id = %s 
+            ORDER BY found_at DESC 
+            LIMIT 5
+        """, (search_id,))
+        latest_cars = cursor.fetchall()
     
     return {
         "search_id": search_id,
@@ -1893,7 +1612,7 @@ async def get_search_stats(search_id: int, user_id: int = Depends(verify_token))
                 "title": car[0],
                 "price": car[1],
                 "is_test": "mock" in (car[2] or ""),
-                "found_at": car[3]
+                "found_at": car[3].isoformat() if car[3] else None
             } for car in latest_cars
         ]
     }
@@ -1901,43 +1620,38 @@ async def get_search_stats(search_id: int, user_id: int = Depends(verify_token))
 @app.get("/test-search/{search_id}")
 async def test_car_search(search_id: int, user_id: int = Depends(verify_token)):
     """Manually trigger a search test with mock data (auto-clears old test cars)"""
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT * FROM car_searches 
-        WHERE id = ? AND user_id = ?
-    """, (search_id, user_id))
-    
-    search = cursor.fetchone()
-    if not search:
-        raise HTTPException(status_code=404, detail="Search not found")
-    
-    # AUTO-CLEAR: Remove old test cars first
-    cursor.execute("""
-        DELETE FROM car_listings 
-        WHERE search_id = ? AND (url LIKE '%mock%' OR url LIKE '%test%')
-    """, (search_id,))
-    old_test_cars = cursor.rowcount
-    
-    search_config = {
-        'make': search[2],
-        'model': search[3],
-        'year_min': search[4],
-        'year_max': search[5],
-        'price_min': search[6],
-        'price_max': search[7],
-        'mileage_max': search[8],
-        'location': search[9] or 'Miami, FL',
-        'distance_miles': search[10] if len(search) > 10 else 25
-    }
-    
-    # Add fresh mock cars
-    mock_cars = get_mock_cars(search_config)
-    enhanced_save_car_listings(search_id, mock_cars)
-    
-    conn.commit()
-    conn.close()
+    with get_db_cursor() as cursor:
+        cursor.execute("""
+            SELECT * FROM car_searches 
+            WHERE id = %s AND user_id = %s
+        """, (search_id, user_id))
+        
+        search = cursor.fetchone()
+        if not search:
+            raise HTTPException(status_code=404, detail="Search not found")
+        
+        # AUTO-CLEAR: Remove old test cars first
+        cursor.execute("""
+            DELETE FROM car_listings 
+            WHERE search_id = %s AND (url LIKE '%mock%' OR url LIKE '%test%')
+        """, (search_id,))
+        old_test_cars = cursor.rowcount
+        
+        search_config = {
+            'make': search[2],
+            'model': search[3],
+            'year_min': search[4],
+            'year_max': search[5],
+            'price_min': search[6],
+            'price_max': search[7],
+            'mileage_max': search[8],
+            'location': search[9] or 'Miami, FL',
+            'distance_miles': search[10] if len(search) > 10 else 25
+        }
+        
+        # Add fresh mock cars
+        mock_cars = get_mock_cars(search_config)
+        enhanced_save_car_listings(search_id, mock_cars)
     
     return {
         "message": f"Replaced {old_test_cars} old test cars with {len(mock_cars)} fresh test cars",
@@ -1985,4 +1699,5 @@ if __name__ == "__main__":
     print(f"📍 Free: 25 miles | Pro: 50 miles | Premium: 200 miles")
     print(f"💰 Pricing: Pro $14.99/mo or $152.99/yr (15% off) | Premium $49.99/mo or $479.99/yr (20% off)")
     print(f"🔑 Secret key configured: {SECRET_KEY[:10]}... (length: {len(SECRET_KEY)})")
+    print("🐘 Using PostgreSQL database for persistent storage")
     uvicorn.run(app, host="0.0.0.0", port=port)
