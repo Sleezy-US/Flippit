@@ -607,7 +607,7 @@ def run_continuous_monitoring():
     
     print("🚀 Starting Enhanced Flippit monitoring!")
     print(f"📊 Mock data: {'Enabled' if USE_MOCK_DATA else 'Disabled'}")
-    print(f"🌐 Selenium: {'Enabled' if USE_SELENIUM and ENHANCED_SCRAPER_AVAILABLE else 'Disabled'}")
+    print(f"🌐 Selenium: {'Enabled' if hasattr(car_monitor, 'scraper') and car_monitor.scraper.use_selenium else 'Disabled'}")
     
     while True:
         try:
