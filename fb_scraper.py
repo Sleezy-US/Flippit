@@ -1,449 +1,333 @@
-import requests
-from bs4 import BeautifulSoup
 import time
 import json
 from datetime import datetime
 import re
-from urllib.parse import urlencode, quote_plus
 import random
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+import logging
 
-class FacebookCarScraper:
-    def __init__(self):
-        self.session = requests.Session()
-        
-        # Car-specific user agents (people browsing for cars)
-        self.user_agents = [
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        ]
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class SeleniumFacebookCarScraper:
+    def __init__(self, use_selenium=True):
+        self.use_selenium = use_selenium
+        self.driver = None
         
         # Location coordinates mapping
         self.location_coords = {
-            'Miami, FL': {'lat': 25.7617, 'lng': -80.1918, 'radius': 40233},  # 25 miles in meters
-            'Orlando, FL': {'lat': 28.5383, 'lng': -81.3792, 'radius': 40233},
-            'Tampa, FL': {'lat': 27.9506, 'lng': -82.4572, 'radius': 40233},
-            'Fort Lauderdale, FL': {'lat': 26.1224, 'lng': -80.1373, 'radius': 40233},
-            'Jacksonville, FL': {'lat': 30.3322, 'lng': -81.6557, 'radius': 40233},
+            'Miami, FL': {'lat': 25.7617, 'lng': -80.1918},
+            'Orlando, FL': {'lat': 28.5383, 'lng': -81.3792},
+            'Tampa, FL': {'lat': 27.9506, 'lng': -82.4572},
+            'Fort Lauderdale, FL': {'lat': 26.1224, 'lng': -80.1373},
+            'Jacksonville, FL': {'lat': 30.3322, 'lng': -81.6557},
         }
         
-        self.update_headers()
-        
-    def update_headers(self):
-        """Update headers with random user agent"""
-        self.session.headers.update({
-            'User-Agent': random.choice(self.user_agents),
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Cache-Control': 'max-age=0',
-        })
-        
-    def get_location_params(self, location_str, distance_miles=25):
-        """Convert location string to Facebook location parameters"""
-        # Check if we have coordinates for this location
-        if location_str in self.location_coords:
-            coords = self.location_coords[location_str]
-            return {
-                'latitude': coords['lat'],
-                'longitude': coords['lng'],
-                'radius': int(distance_miles * 1609.34)  # Convert miles to meters
-            }
-        
-        # Try to extract city name for partial matches
-        for known_loc, coords in self.location_coords.items():
-            if location_str.lower() in known_loc.lower():
-                return {
-                    'latitude': coords['lat'],
-                    'longitude': coords['lng'],
-                    'radius': int(distance_miles * 1609.34)
-                }
-        
-        # Default to Miami if location not found
-        miami_coords = self.location_coords['Miami, FL']
-        return {
-            'latitude': miami_coords['lat'],
-            'longitude': miami_coords['lng'],
-            'radius': int(distance_miles * 1609.34)
-        }
-        
+        if self.use_selenium:
+            self.setup_driver()
+    
+    def setup_driver(self):
+        """Setup Chrome driver for Railway/Heroku deployment"""
+        try:
+            chrome_options = Options()
+            
+            # Essential options for headless operation
+            chrome_options.add_argument('--headless')
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            chrome_options.add_argument('--disable-gpu')
+            chrome_options.add_argument('--disable-web-security')
+            chrome_options.add_argument('--disable-features=VizDisplayCompositor')
+            
+            # Performance options
+            chrome_options.add_argument('--memory-pressure-off')
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            
+            # Set window size to ensure elements are visible
+            chrome_options.add_argument('--window-size=1920,1080')
+            
+            # User agent to look more real
+            chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+            
+            # Disable images for faster loading (optional)
+            prefs = {"profile.managed_default_content_settings.images": 2}
+            chrome_options.add_experimental_option("prefs", prefs)
+            
+            # Initialize driver
+            self.driver = webdriver.Chrome(options=chrome_options)
+            self.driver.set_page_load_timeout(30)
+            
+            logger.info("✅ Selenium Chrome driver initialized successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to setup Selenium driver: {e}")
+            self.use_selenium = False
+    
     def search_cars(self, make=None, model=None, year_min=None, year_max=None,
-                   price_min=None, price_max=None, mileage_max=None, location="", distance_miles=25):
-        """
-        Search Facebook Marketplace specifically for cars
-        """
-        # Build search query for cars
-        query_parts = []
-        if make:
-            query_parts.append(make)
-        if model:
-            query_parts.append(model)
+                   price_min=None, price_max=None, mileage_max=None,
+                   location="Miami, FL", distance_miles=25):
+        """Search Facebook Marketplace for cars using Selenium"""
         
-        query = " ".join(query_parts) if query_parts else "car"
+        if not self.use_selenium or not self.driver:
+            logger.warning("⚠️ Selenium not available, falling back to basic scraper")
+            return []
         
-        print(f"🚗 Searching for cars: {query}")
-        if year_min or year_max:
-            print(f"   📅 Year range: {year_min or 'any'} - {year_max or 'current'}")
-        if price_min or price_max:
-            print(f"   💰 Price range: ${price_min or 0:,} - ${price_max or 999999:,}")
-        if mileage_max:
-            print(f"   🛣️  Max mileage: {mileage_max:,} miles")
-        if location:
-            print(f"   📍 Location: {location} (within {distance_miles} miles)")
-        
-        # Try different car-specific URL approaches with location
-        urls_to_try = [
-            self.build_car_search_url_v1(query, year_min, year_max, price_min, price_max, location, distance_miles),
-            self.build_car_search_url_v2(make, model, year_min, year_max, price_min, price_max, location, distance_miles),
-            self.build_vehicle_category_url(query, price_min, price_max, location, distance_miles)
-        ]
-        
-        for i, search_url in enumerate(urls_to_try):
-            try:
-                print(f"  📡 Trying car search approach {i+1}...")
-                print(f"     {search_url[:150]}...")
-                
-                # Add random delay to look more human
-                time.sleep(random.uniform(2, 5))
-                
-                response = self.session.get(search_url, timeout=15)
-                print(f"  📊 Response status: {response.status_code}")
-                
-                if response.status_code == 200:
-                    cars = self.parse_car_listings(response.text)
-                    print(f"  ✅ Successfully parsed {len(cars)} car listings")
-                    return cars
-                elif response.status_code == 429:
-                    print("  ⚠️  Rate limited - waiting longer...")
-                    time.sleep(60)
-                else:
-                    print(f"  ❌ Status {response.status_code}: {response.reason}")
-                    
-            except requests.RequestException as e:
-                print(f"  ❌ Request error: {e}")
-                continue
-                
-        print("  🚫 All car search approaches failed")
-        return []
-    
-    def build_car_search_url_v1(self, query, year_min, year_max, price_min, price_max, location, distance_miles):
-        """Car-specific search URL with vehicle category and location"""
-        search_params = {
-            'query': query,
-            'category_id': '807311116002614',  # Facebook's vehicle category ID
-            'sortBy': 'creation_time_descend',
-        }
-        
-        # Add location parameters
-        if location:
-            loc_params = self.get_location_params(location, distance_miles)
-            search_params.update(loc_params)
-        
-        if price_max:
-            search_params['maxPrice'] = price_max
-        if price_min:
-            search_params['minPrice'] = price_min
-        if year_min:
-            search_params['minYear'] = year_min
-        if year_max:
-            search_params['maxYear'] = year_max
+        try:
+            # Build Facebook Marketplace URL
+            url = self._build_marketplace_url(
+                make, model, year_min, year_max,
+                price_min, price_max, location, distance_miles
+            )
             
-        base_url = "https://www.facebook.com/marketplace/search/?"
-        return base_url + urlencode(search_params)
-    
-    def build_car_search_url_v2(self, make, model, year_min, year_max, price_min, price_max, location, distance_miles):
-        """Alternative car search URL with location"""
-        query = f"{make or ''} {model or ''}".strip() or "vehicle"
-        
-        search_params = {
-            'q': query,
-            'category_id': '807311116002614',
-            'sortBy': 'best_match',
-        }
-        
-        # Add location parameters
-        if location:
-            loc_params = self.get_location_params(location, distance_miles)
-            search_params.update(loc_params)
-        
-        if price_max:
-            search_params['priceMax'] = price_max
-        if price_min:
-            search_params['priceMin'] = price_min
+            logger.info(f"🚗 Searching for: {make or 'Any'} {model or 'car'}")
+            logger.info(f"📍 Location: {location} ({distance_miles} miles)")
+            logger.info(f"🔗 URL: {url}")
             
-        base_url = "https://www.facebook.com/marketplace/search/?"
-        return base_url + urlencode(search_params)
-    
-    def build_vehicle_category_url(self, query, price_min, price_max, location, distance_miles):
-        """Direct vehicle category browse with location"""
-        search_params = {
-            'query': query,
-            'sortBy': 'creation_time_descend',
-        }
-        
-        # Add location parameters
-        if location:
-            loc_params = self.get_location_params(location, distance_miles)
-            search_params.update(loc_params)
-        
-        if price_max:
-            search_params['maxPrice'] = price_max
-        if price_min:
-            search_params['minPrice'] = price_min
+            # Navigate to the page
+            self.driver.get(url)
             
-        # Try Miami-specific marketplace URL
-        if "Miami" in location:
-            base_url = "https://www.facebook.com/marketplace/miami/vehicles/?"
+            # Wait for page to load
+            time.sleep(random.uniform(3, 5))
+            
+            # Handle login prompt if it appears
+            if self._check_login_required():
+                logger.warning("🚫 Facebook requires login - using mock data")
+                return []
+            
+            # Scroll to load more results
+            self._scroll_page()
+            
+            # Extract listings
+            listings = self._extract_listings()
+            
+            logger.info(f"✅ Found {len(listings)} car listings")
+            return listings
+            
+        except Exception as e:
+            logger.error(f"❌ Selenium search error: {e}")
+            return []
+    
+    def _build_marketplace_url(self, make, model, year_min, year_max,
+                              price_min, price_max, location, distance_miles):
+        """Build Facebook Marketplace URL with all parameters"""
+        
+        # Get location coordinates
+        coords = self.location_coords.get(location, self.location_coords['Miami, FL'])
+        
+        # Base URL for vehicles in specific location
+        if location == "Miami, FL":
+            base_url = "https://www.facebook.com/marketplace/miami/vehicles"
         else:
-            base_url = "https://www.facebook.com/marketplace/category/vehicles/?"
+            base_url = "https://www.facebook.com/marketplace/category/vehicles"
+        
+        # Build query parameters
+        params = []
+        
+        # Search query
+        if make or model:
+            query = f"{make or ''} {model or ''}".strip()
+            params.append(f"query={query}")
+        
+        # Price range
+        if price_min:
+            params.append(f"minPrice={price_min}")
+        if price_max:
+            params.append(f"maxPrice={price_max}")
+        
+        # Year range
+        if year_min:
+            params.append(f"minYear={year_min}")
+        if year_max:
+            params.append(f"maxYear={year_max}")
+        
+        # Location parameters
+        params.append(f"latitude={coords['lat']}")
+        params.append(f"longitude={coords['lng']}")
+        params.append(f"radius={int(distance_miles * 1.60934)}")  # Convert to km
+        
+        # Sort by newest
+        params.append("sortBy=creation_time_descend")
+        
+        # Combine URL
+        if params:
+            return f"{base_url}?{'&'.join(params)}"
+        return base_url
+    
+    def _check_login_required(self):
+        """Check if Facebook is showing login page"""
+        try:
+            # Check for common login indicators
+            login_indicators = [
+                "//button[contains(text(), 'Log In')]",
+                "//a[contains(@href, '/login')]",
+                "//div[contains(text(), 'You must log in')]"
+            ]
             
-        return base_url + urlencode(search_params)
-    
-    def parse_car_listings(self, html_content):
-        """
-        Parse HTML content specifically for car listings
-        """
-        soup = BeautifulSoup(html_content, 'html.parser')
-        cars = []
-        
-        print("  🔎 Analyzing car listings...")
-        
-        # Check if we got blocked
-        if "log in" in html_content.lower() or "login" in html_content.lower():
-            print("  🚫 Got login page - Facebook is blocking us")
-            return []
-        
-        if "marketplace" not in html_content.lower() and "vehicle" not in html_content.lower():
-            print("  🚫 Page doesn't contain marketplace/vehicle content")
-            return []
-        
-        # Car-specific selectors
-        car_selectors = [
-            'div[data-testid*="marketplace"]',
-            'div[data-testid*="vehicle"]',
-            'a[href*="/marketplace/item/"]',
-            'div[aria-label*="vehicle"]',
-            'div[aria-label*="car"]',
-        ]
-        
-        for selector in car_selectors:
-            try:
-                elements = soup.select(selector)
-                print(f"     Found {len(elements)} elements with car selector: {selector}")
-                
+            for indicator in login_indicators:
+                elements = self.driver.find_elements(By.XPATH, indicator)
                 if elements:
-                    cars.extend(self.extract_car_data_from_elements(elements))
+                    return True
+            return False
+        except:
+            return False
+    
+    def _scroll_page(self):
+        """Scroll page to load more results"""
+        try:
+            last_height = self.driver.execute_script("return document.body.scrollHeight")
+            scrolls = 0
+            max_scrolls = 5
+            
+            while scrolls < max_scrolls:
+                # Scroll down
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(random.uniform(2, 3))
+                
+                # Check if more content loaded
+                new_height = self.driver.execute_script("return document.body.scrollHeight")
+                if new_height == last_height:
+                    break
                     
-            except Exception as e:
-                print(f"     Error with selector {selector}: {e}")
-                continue
-        
-        # Remove duplicates and filter for car-like listings
-        unique_cars = []
-        seen_listings = set()
-        
-        for car in cars:
-            car_id = f"{car['title']}_{car['price']}"
-            if car_id not in seen_listings and self.is_likely_car(car):
-                unique_cars.append(car)
-                seen_listings.add(car_id)
-        
-        return unique_cars[:15]  # Limit to 15 results
+                last_height = new_height
+                scrolls += 1
+                
+            logger.info(f"📜 Scrolled {scrolls} times to load results")
+        except Exception as e:
+            logger.error(f"Scroll error: {e}")
     
-    def extract_car_data_from_elements(self, elements):
-        """Extract car-specific data from HTML elements"""
-        cars = []
+    def _extract_listings(self):
+        """Extract car listings from the page"""
+        listings = []
         
-        for element in elements[:30]:  # Process more elements for cars
-            try:
-                text_content = element.get_text() if element else ""
-                
-                # Look for car price patterns
-                price_patterns = [r'\$[\d,]+', r'\$\d+']
-                prices = []
-                for pattern in price_patterns:
-                    prices.extend(re.findall(pattern, text_content))
-                
-                if prices and len(text_content) > 10:
-                    # Extract car details
-                    car_data = self.extract_car_details(text_content)
+        try:
+            # Wait for listings to be present
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, "//a[contains(@href, '/marketplace/item/')]"))
+            )
+            
+            # Find all listing links
+            listing_elements = self.driver.find_elements(
+                By.XPATH, "//a[contains(@href, '/marketplace/item/')]"
+            )
+            
+            for element in listing_elements[:20]:  # Limit to 20 results
+                try:
+                    listing = self._extract_listing_data(element)
+                    if listing and self._is_valid_car_listing(listing):
+                        listings.append(listing)
+                except Exception as e:
+                    continue
                     
-                    if car_data['title'] and len(car_data['title']) > 3:
-                        car_data.update({
-                            'price': prices[0],
-                            'timestamp': datetime.now().isoformat(),
-                            'url': self.extract_listing_url(element),
-                        })
-                        cars.append(car_data)
-                        
-            except Exception as e:
-                continue
+        except TimeoutException:
+            logger.warning("⏱️ Timeout waiting for listings")
+        except Exception as e:
+            logger.error(f"❌ Error extracting listings: {e}")
+            
+        return listings
+    
+    def _extract_listing_data(self, element):
+        """Extract data from a single listing element"""
+        try:
+            # Get the parent container for more data
+            container = element.find_element(By.XPATH, "./ancestor::div[contains(@style, 'border-radius')]")
+            text = container.text
+            
+            # Extract price
+            price_match = re.search(r'\$[\d,]+', text)
+            if not price_match:
+                return None
                 
-        return cars
+            price = price_match.group()
+            
+            # Extract title (usually first line)
+            lines = text.split('\n')
+            title = lines[0] if lines else ""
+            
+            # Extract year
+            year_match = re.search(r'\b(19\d{2}|20\d{2})\b', text)
+            year = year_match.group() if year_match else None
+            
+            # Extract mileage
+            mileage_match = re.search(r'([\d,]+)\s*(?:miles?|mi\b)', text, re.IGNORECASE)
+            mileage = mileage_match.group(1) if mileage_match else None
+            
+            # Get URL
+            url = element.get_attribute('href')
+            if url and not url.startswith('http'):
+                url = f"https://www.facebook.com{url}"
+            
+            return {
+                'title': title,
+                'price': price,
+                'year': year,
+                'mileage': mileage,
+                'url': url,
+                'location': text.split('\n')[-1] if '\n' in text else "",
+                'raw_text': text[:200],
+                'found_at': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            return None
     
-    def extract_car_details(self, text):
-        """Extract car-specific details from text"""
-        # Clean the text
-        text = ' '.join(text.split())
-        
-        # Common car-related patterns
-        year_pattern = r'\b(19|20)\d{2}\b'
-        mileage_pattern = r'([\d,]+)\s*(miles?|mi|k\s*miles?)'
-        
-        # Extract year
-        year_matches = re.findall(year_pattern, text)
-        year = year_matches[0] if year_matches else None
-        
-        # Extract mileage
-        mileage_matches = re.findall(mileage_pattern, text, re.IGNORECASE)
-        mileage = mileage_matches[0][0] if mileage_matches else None
-        
-        # Extract title (remove price and common car terms)
-        title = text
-        title = re.sub(r'\$[\d,]+', '', title)  # Remove prices
-        title = re.sub(r'\b\d+\s*miles?\b', '', title, flags=re.IGNORECASE)  # Remove mileage
-        
-        # Take relevant words for title
-        words = title.split()
-        if len(words) > 2:
-            # Try to find make/model in first part
-            title = ' '.join(words[:10])  # First 10 words
-        
-        return {
-            'title': title.strip(),
-            'year': year,
-            'mileage': mileage,
-            'raw_text': text[:200]  # Keep sample of original text
-        }
-    
-    def is_likely_car(self, listing):
-        """Check if listing is likely a car"""
+    def _is_valid_car_listing(self, listing):
+        """Check if listing is a valid car"""
         text = (listing.get('title', '') + ' ' + listing.get('raw_text', '')).lower()
         
-        # Car indicators
-        car_keywords = [
-            'car', 'auto', 'vehicle', 'sedan', 'suv', 'truck', 'coupe', 'wagon',
-            'honda', 'toyota', 'ford', 'chevrolet', 'nissan', 'bmw', 'mercedes',
-            'audi', 'volkswagen', 'hyundai', 'kia', 'mazda', 'subaru', 'jeep',
-            'miles', 'mileage', 'engine', 'transmission', 'automatic', 'manual'
-        ]
-        
-        # Non-car indicators (to filter out)
-        non_car_keywords = [
-            'house', 'apartment', 'furniture', 'phone', 'computer', 'laptop',
-            'clothing', 'shoes', 'toy', 'book', 'game', 'electronics'
-        ]
-        
-        car_score = sum(1 for keyword in car_keywords if keyword in text)
-        non_car_score = sum(1 for keyword in non_car_keywords if keyword in text)
-        
-        return car_score > 0 and car_score > non_car_score
-    
-    def extract_listing_url(self, element):
-        """Extract the URL for a car listing"""
-        link = element.find('a', href=True)
-        if not link and element.parent:
-            link = element.parent.find('a', href=True)
-        
-        if link:
-            href = link['href']
-            if '/marketplace/' in href:
-                if href.startswith('/'):
-                    return f"https://www.facebook.com{href}"
-                return href
-        return None
-
-class CarSearchMonitor:
-    def __init__(self):
-        self.scraper = FacebookCarScraper()
-        self.seen_cars = set()
-        
-    def monitor_car_search(self, search_config):
-        """
-        Monitor a car search and return new listings
-        """
-        make = search_config.get('make', '')
-        model = search_config.get('model', '')
-        year_min = search_config.get('year_min')
-        year_max = search_config.get('year_max')
-        price_min = search_config.get('price_min')
-        price_max = search_config.get('price_max')
-        mileage_max = search_config.get('mileage_max')
-        location = search_config.get('location', '')
-        distance_miles = search_config.get('distance_miles', 25)
-        
-        search_name = f"{make} {model}".strip() or "cars"
-        print(f"\n🎯 Monitoring car search: {search_name}")
-        
-        # Get current car listings
-        current_cars = self.scraper.search_cars(
-            make=make,
-            model=model,
-            year_min=year_min,
-            year_max=year_max,
-            price_min=price_min,
-            price_max=price_max,
-            mileage_max=mileage_max,
-            location=location,
-            distance_miles=distance_miles
-        )
-        
-        # Filter out cars we've already seen
-        new_cars = []
-        for car in current_cars:
-            car_id = f"{car['title']}_{car['price']}"
-            if car_id not in self.seen_cars:
-                self.seen_cars.add(car_id)
-                new_cars.append(car)
-        
-        print(f"   📊 Found {len(current_cars)} total cars, {len(new_cars)} new")
-        return new_cars
-    
-    def continuous_car_monitor(self, search_configs, check_interval=600):
-        """
-        Continuously monitor car searches (longer intervals for cars)
-        """
-        print(f"🚀 Starting continuous car monitoring (checking every {check_interval//60} minutes)")
-        
-        while True:
-            for config in search_configs:
-                try:
-                    new_cars = self.monitor_car_search(config)
-                    
-                    if new_cars:
-                        search_name = f"{config.get('make', '')} {config.get('model', '')}".strip()
-                        print(f"\n🚨 Found {len(new_cars)} new cars for '{search_name}':")
-                        
-                        for car in new_cars:
-                            print(f"  🚗 {car['title']} - {car['price']}")
-                            if car.get('year'):
-                                print(f"     📅 Year: {car['year']}")
-                            if car.get('mileage'):
-                                print(f"     🛣️  Mileage: {car['mileage']}")
-                            if car['url']:
-                                print(f"     🔗 {car['url']}")
-                        
-                        self.send_car_notifications(new_cars, config)
-                    else:
-                        search_name = f"{config.get('make', '')} {config.get('model', '')}".strip()
-                        print(f"   😴 No new cars for '{search_name}'")
-                        
-                except Exception as e:
-                    print(f"❌ Error monitoring car search: {e}")
-                
-                # Longer delay between car searches
-                time.sleep(random.uniform(10, 20))
+        # Must have price and title
+        if not listing.get('price') or not listing.get('title'):
+            return False
             
-            print(f"\n💤 Waiting {check_interval//60} minutes before next car check...")
-            time.sleep(check_interval)
+        # Car keywords
+        car_indicators = ['car', 'vehicle', 'miles', 'automatic', 'manual',
+                         'sedan', 'suv', 'truck', 'van', 'coupe']
+        
+        # Check if any car indicator is present
+        return any(indicator in text for indicator in car_indicators)
     
-    def send_car_notifications(self, cars, search_config):
-        """
-        Send notifications for new car listings
-        """
-        print(f"📱 Would send car notifications for {len(cars)} listings")
+    def cleanup(self):
+        """Close the Selenium driver"""
+        if self.driver:
+            self.driver.quit()
+            logger.info("🧹 Selenium driver closed")
+
+# Wrapper to use either Selenium or basic scraper
+class EnhancedFacebookCarScraper:
+    def __init__(self, use_selenium=True):
+        self.use_selenium = use_selenium and self._check_selenium_available()
+        
+        if self.use_selenium:
+            logger.info("🚀 Using Selenium-enhanced scraper")
+            self.scraper = SeleniumFacebookCarScraper(use_selenium=True)
+        else:
+            logger.info("⚠️ Selenium not available, using basic scraper")
+            # Fall back to your existing scraper
+            from fb_scraper import FacebookCarScraper
+            self.scraper = FacebookCarScraper()
+    
+    def _check_selenium_available(self):
+        """Check if Selenium and Chrome are available"""
+        try:
+            from selenium import webdriver
+            # Try to create a headless Chrome instance
+            options = webdriver.ChromeOptions()
+            options.add_argument('--headless')
+            driver = webdriver.Chrome(options=options)
+            driver.quit()
+            return True
+        except:
+            return False
+    
+    def search_cars(self, **kwargs):
+        """Search for cars using the appropriate scraper"""
+        return self.scraper.search_cars(**kwargs)
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        if hasattr(self.scraper, 'cleanup'):
+            self.scraper.cleanup()

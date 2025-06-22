@@ -1,5 +1,2 @@
 [phases.setup]
 nixPkgs = ["...", "chromium", "chromedriver"]
-
-[phases.install]
-cmds = ["pip install selenium==4.15.0"]
