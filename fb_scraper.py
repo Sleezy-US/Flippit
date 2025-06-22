@@ -18,6 +18,15 @@ class FacebookCarScraper:
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         ]
         
+        # Location coordinates mapping
+        self.location_coords = {
+            'Miami, FL': {'lat': 25.7617, 'lng': -80.1918, 'radius': 40233},  # 25 miles in meters
+            'Orlando, FL': {'lat': 28.5383, 'lng': -81.3792, 'radius': 40233},
+            'Tampa, FL': {'lat': 27.9506, 'lng': -82.4572, 'radius': 40233},
+            'Fort Lauderdale, FL': {'lat': 26.1224, 'lng': -80.1373, 'radius': 40233},
+            'Jacksonville, FL': {'lat': 30.3322, 'lng': -81.6557, 'radius': 40233},
+        }
+        
         self.update_headers()
         
     def update_headers(self):
@@ -35,8 +44,36 @@ class FacebookCarScraper:
             'Cache-Control': 'max-age=0',
         })
         
+    def get_location_params(self, location_str, distance_miles=25):
+        """Convert location string to Facebook location parameters"""
+        # Check if we have coordinates for this location
+        if location_str in self.location_coords:
+            coords = self.location_coords[location_str]
+            return {
+                'latitude': coords['lat'],
+                'longitude': coords['lng'],
+                'radius': int(distance_miles * 1609.34)  # Convert miles to meters
+            }
+        
+        # Try to extract city name for partial matches
+        for known_loc, coords in self.location_coords.items():
+            if location_str.lower() in known_loc.lower():
+                return {
+                    'latitude': coords['lat'],
+                    'longitude': coords['lng'],
+                    'radius': int(distance_miles * 1609.34)
+                }
+        
+        # Default to Miami if location not found
+        miami_coords = self.location_coords['Miami, FL']
+        return {
+            'latitude': miami_coords['lat'],
+            'longitude': miami_coords['lng'],
+            'radius': int(distance_miles * 1609.34)
+        }
+        
     def search_cars(self, make=None, model=None, year_min=None, year_max=None,
-                   price_min=None, price_max=None, mileage_max=None, location=""):
+                   price_min=None, price_max=None, mileage_max=None, location="", distance_miles=25):
         """
         Search Facebook Marketplace specifically for cars
         """
@@ -57,19 +94,19 @@ class FacebookCarScraper:
         if mileage_max:
             print(f"   🛣️  Max mileage: {mileage_max:,} miles")
         if location:
-            print(f"   📍 Location: {location}")
+            print(f"   📍 Location: {location} (within {distance_miles} miles)")
         
-        # Try different car-specific URL approaches
+        # Try different car-specific URL approaches with location
         urls_to_try = [
-            self.build_car_search_url_v1(query, year_min, year_max, price_min, price_max, location),
-            self.build_car_search_url_v2(make, model, year_min, year_max, price_min, price_max, location),
-            self.build_vehicle_category_url(query, price_min, price_max, location)
+            self.build_car_search_url_v1(query, year_min, year_max, price_min, price_max, location, distance_miles),
+            self.build_car_search_url_v2(make, model, year_min, year_max, price_min, price_max, location, distance_miles),
+            self.build_vehicle_category_url(query, price_min, price_max, location, distance_miles)
         ]
         
         for i, search_url in enumerate(urls_to_try):
             try:
                 print(f"  📡 Trying car search approach {i+1}...")
-                print(f"     {search_url[:100]}...")
+                print(f"     {search_url[:150]}...")
                 
                 # Add random delay to look more human
                 time.sleep(random.uniform(2, 5))
@@ -94,20 +131,23 @@ class FacebookCarScraper:
         print("  🚫 All car search approaches failed")
         return []
     
-    def build_car_search_url_v1(self, query, year_min, year_max, price_min, price_max, location):
-        """Car-specific search URL with vehicle category"""
+    def build_car_search_url_v1(self, query, year_min, year_max, price_min, price_max, location, distance_miles):
+        """Car-specific search URL with vehicle category and location"""
         search_params = {
             'query': query,
-            'category': 'vehicles',  # Facebook's vehicle category
+            'category_id': '807311116002614',  # Facebook's vehicle category ID
             'sortBy': 'creation_time_descend',
         }
+        
+        # Add location parameters
+        if location:
+            loc_params = self.get_location_params(location, distance_miles)
+            search_params.update(loc_params)
         
         if price_max:
             search_params['maxPrice'] = price_max
         if price_min:
             search_params['minPrice'] = price_min
-        if location:
-            search_params['location'] = location
         if year_min:
             search_params['minYear'] = year_min
         if year_max:
@@ -116,42 +156,52 @@ class FacebookCarScraper:
         base_url = "https://www.facebook.com/marketplace/search/?"
         return base_url + urlencode(search_params)
     
-    def build_car_search_url_v2(self, make, model, year_min, year_max, price_min, price_max, location):
-        """Alternative car search URL"""
+    def build_car_search_url_v2(self, make, model, year_min, year_max, price_min, price_max, location, distance_miles):
+        """Alternative car search URL with location"""
         query = f"{make or ''} {model or ''}".strip() or "vehicle"
         
         search_params = {
             'q': query,
-            'category': 'vehicles',
+            'category_id': '807311116002614',
             'sortBy': 'best_match',
         }
+        
+        # Add location parameters
+        if location:
+            loc_params = self.get_location_params(location, distance_miles)
+            search_params.update(loc_params)
         
         if price_max:
             search_params['priceMax'] = price_max
         if price_min:
             search_params['priceMin'] = price_min
-        if location:
-            search_params['location'] = location
             
         base_url = "https://www.facebook.com/marketplace/search/?"
         return base_url + urlencode(search_params)
     
-    def build_vehicle_category_url(self, query, price_min, price_max, location):
-        """Direct vehicle category browse"""
+    def build_vehicle_category_url(self, query, price_min, price_max, location, distance_miles):
+        """Direct vehicle category browse with location"""
         search_params = {
             'query': query,
             'sortBy': 'creation_time_descend',
         }
         
+        # Add location parameters
+        if location:
+            loc_params = self.get_location_params(location, distance_miles)
+            search_params.update(loc_params)
+        
         if price_max:
             search_params['maxPrice'] = price_max
         if price_min:
             search_params['minPrice'] = price_min
-        if location:
-            search_params['location'] = location
             
-        # Try the vehicles category directly
-        base_url = "https://www.facebook.com/marketplace/category/vehicles/?"
+        # Try Miami-specific marketplace URL
+        if "Miami" in location:
+            base_url = "https://www.facebook.com/marketplace/miami/vehicles/?"
+        else:
+            base_url = "https://www.facebook.com/marketplace/category/vehicles/?"
+            
         return base_url + urlencode(search_params)
     
     def parse_car_listings(self, html_content):
@@ -247,7 +297,7 @@ class FacebookCarScraper:
         
         # Extract year
         year_matches = re.findall(year_pattern, text)
-        year = year_matches[0] + year_matches[0][0:2] if year_matches else None
+        year = year_matches[0] if year_matches else None
         
         # Extract mileage
         mileage_matches = re.findall(mileage_pattern, text, re.IGNORECASE)
@@ -325,6 +375,7 @@ class CarSearchMonitor:
         price_max = search_config.get('price_max')
         mileage_max = search_config.get('mileage_max')
         location = search_config.get('location', '')
+        distance_miles = search_config.get('distance_miles', 25)
         
         search_name = f"{make} {model}".strip() or "cars"
         print(f"\n🎯 Monitoring car search: {search_name}")
@@ -338,7 +389,8 @@ class CarSearchMonitor:
             price_min=price_min,
             price_max=price_max,
             mileage_max=mileage_max,
-            location=location
+            location=location,
+            distance_miles=distance_miles
         )
         
         # Filter out cars we've already seen
@@ -395,63 +447,3 @@ class CarSearchMonitor:
         Send notifications for new car listings
         """
         print(f"📱 Would send car notifications for {len(cars)} listings")
-
-# Example usage for cars
-if __name__ == "__main__":
-    # Define your car searches
-    car_searches = [
-        {
-            'make': 'Honda',
-            'model': 'Civic',
-            'year_min': 2018,
-            'year_max': 2024,
-            'price_min': 15000,
-            'price_max': 25000,
-            'mileage_max': 50000,
-            'location': 'Miami, FL'
-        },
-        {
-            'make': 'Toyota',
-            'model': 'Camry',
-            'year_min': 2019,
-            'price_max': 30000,
-            'location': 'Orlando, FL'
-        },
-        {
-            'make': 'BMW',
-            'model': 'X3',
-            'price_min': 20000,
-            'price_max': 40000,
-        },
-        {
-            # General luxury cars under 50k
-            'price_min': 30000,
-            'price_max': 50000,
-            'location': 'Tampa, FL'
-        }
-    ]
-    
-    # Start monitoring
-    monitor = CarSearchMonitor()
-    
-    # Run a single check first
-    print("🏁 Running initial car search test...")
-    for search in car_searches:
-        results = monitor.monitor_car_search(search)
-        search_name = f"{search.get('make', '')} {search.get('model', '')}".strip() or "cars"
-        
-        if results:
-            print(f"✅ Success! Found car listings for '{search_name}'")
-            for result in results[:3]:  # Show first 3
-                print(f"   🚗 {result['title']} - {result['price']}")
-        else:
-            print(f"⚠️  No results for '{search_name}' - Facebook may be blocking")
-    
-    print("\n🔧 Next steps to improve car scraping:")
-    print("   1. Add Selenium for browser automation")
-    print("   2. Use rotating proxies")
-    print("   3. Add car-specific data extraction (VIN, transmission, etc.)")
-    print("   4. Integrate with car valuation APIs (KBB, Edmunds)")
-    
-    # Uncomment to start continuous monitoring (checks every 10 minutes)
-    # monitor.continuous_car_monitor(car_searches, check_interval=600)
