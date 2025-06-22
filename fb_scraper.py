@@ -296,6 +296,17 @@ class SeleniumFacebookCarScraper:
             self.driver.quit()
             logger.info("🧹 Selenium driver closed")
 
+# Basic Facebook scraper fallback
+class FacebookCarScraper:
+    """Basic scraper without Selenium - fallback option"""
+    def __init__(self):
+        self.base_url = "https://www.facebook.com/marketplace"
+        
+    def search_cars(self, **kwargs):
+        """Basic search that returns empty results"""
+        logger.warning("Basic scraper called - no Selenium available")
+        return []
+
 # Wrapper to use either Selenium or basic scraper
 class EnhancedFacebookCarScraper:
     def __init__(self, use_selenium=True):
@@ -306,8 +317,7 @@ class EnhancedFacebookCarScraper:
             self.scraper = SeleniumFacebookCarScraper(use_selenium=True)
         else:
             logger.info("⚠️ Selenium not available, using basic scraper")
-            # Fall back to your existing scraper
-            from fb_scraper import FacebookCarScraper
+            # Fall back to basic scraper
             self.scraper = FacebookCarScraper()
     
     def _check_selenium_available(self):
@@ -331,3 +341,31 @@ class EnhancedFacebookCarScraper:
         """Cleanup resources"""
         if hasattr(self.scraper, 'cleanup'):
             self.scraper.cleanup()
+
+# Main monitoring class that the API expects
+class CarSearchMonitor:
+    """Main monitoring class that uses the enhanced scraper"""
+    def __init__(self, use_selenium=True, use_mock_data=False):
+        self.use_mock_data = use_mock_data
+        self.scraper = EnhancedFacebookCarScraper(use_selenium=use_selenium)
+    
+    def monitor_car_search(self, search_config):
+        """Monitor for new car listings"""
+        if self.use_mock_data:
+            return []  # Let the API handle mock data
+        
+        return self.scraper.search_cars(
+            make=search_config.get('make'),
+            model=search_config.get('model'),
+            year_min=search_config.get('year_min'),
+            year_max=search_config.get('year_max'),
+            price_min=search_config.get('price_min'),
+            price_max=search_config.get('price_max'),
+            mileage_max=search_config.get('mileage_max'),
+            location=search_config.get('location', 'Miami, FL'),
+            distance_miles=search_config.get('distance_miles', 25)
+        )
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        self.scraper.cleanup()
