@@ -1,293 +1,217 @@
 """
-Enhanced Distributed Scraper with Maximum Facebook Success Rate
-This integrates with your DigitalOcean VPS for better scraping
+Enhanced Distributed Scraper for Railway
+Connects to your DigitalOcean VPS nodes for better scraping success
 """
 
+import os
+import json
 import requests
-import asyncio
-import aiohttp
+import logging
+from typing import List, Dict, Optional, Any
+from datetime import datetime, timedelta
 import random
 import time
-import logging
-from typing import List, Dict, Optional
-from datetime import datetime, timedelta
-import json
-import os
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
-class DistributedScraperClient:
-    """Client that connects to your VPS nodes for scraping"""
+class DistributedNode:
+    """Represents a single VPS scraper node"""
+    
+    def __init__(self, config: Dict[str, str]):
+        self.id = config['id']
+        self.url = config['url'].rstrip('/')
+        self.provider = config.get('provider', 'unknown')
+        self.region = config.get('region', 'unknown')
+        self.last_used = None
+        self.success_count = 0
+        self.failure_count = 0
+        self.is_healthy = True
+        self.cooldown_until = None
+        
+    @property
+    def success_rate(self) -> float:
+        total = self.success_count + self.failure_count
+        return self.success_count / total if total > 0 else 0.5
+        
+    def is_available(self) -> bool:
+        """Check if node is available for use"""
+        if not self.is_healthy:
+            return False
+        if self.cooldown_until and datetime.now() < self.cooldown_until:
+            return False
+        return True
+        
+    def set_cooldown(self, seconds: int = 30):
+        """Put node on cooldown"""
+        self.cooldown_until = datetime.now() + timedelta(seconds=seconds)
+        logger.info(f"Node {self.id} on cooldown for {seconds}s")
+
+class DistributedScraper:
+    """Manages distributed scraping across VPS nodes"""
     
     def __init__(self):
-        # Load nodes from environment
-        self.nodes = json.loads(os.getenv('DISTRIBUTED_NODES', '[]'))
+        # Load configuration
         self.node_secret = os.getenv('NODE_SECRET', '')
-        self.current_node_index = 0
-        self.node_cooldowns = {}
+        nodes_config = os.getenv('DISTRIBUTED_NODES', '[]')
         
-        logger.info(f"🌐 Distributed scraper initialized with {len(self.nodes)} nodes")
-        
-    def get_next_available_node(self):
-        """Get next available node using round-robin with cooldowns"""
-        now = datetime.now()
-        attempts = 0
-        
-        while attempts < len(self.nodes):
-            node = self.nodes[self.current_node_index]
-            self.current_node_index = (self.current_node_index + 1) % len(self.nodes)
-            
-            # Check if node is in cooldown
-            cooldown_until = self.node_cooldowns.get(node['id'])
-            if cooldown_until and now < cooldown_until:
-                attempts += 1
-                continue
-                
-            return node
-            
-        logger.warning("All nodes are in cooldown!")
-        return None
-        
-    async def scrape_with_node(self, node: Dict, search_params: Dict) -> List[Dict]:
-        """Send scraping request to a specific node"""
         try:
-            url = f"{node['url']}/scrape"
+            nodes_data = json.loads(nodes_config)
+            self.nodes = [DistributedNode(config) for config in nodes_data]
+            logger.info(f"✅ Loaded {len(self.nodes)} distributed nodes")
+        except Exception as e:
+            logger.error(f"Failed to load distributed nodes: {e}")
+            self.nodes = []
+            
+        # Configuration
+        self.timeout = 30
+        self.max_retries = 2
+        self.executor = ThreadPoolExecutor(max_workers=3)
+        
+    def get_available_nodes(self) -> List[DistributedNode]:
+        """Get list of available nodes sorted by success rate"""
+        available = [node for node in self.nodes if node.is_available()]
+        return sorted(available, key=lambda n: n.success_rate, reverse=True)
+        
+    def health_check_all(self):
+        """Check health of all nodes"""
+        for node in self.nodes:
+            try:
+                response = requests.get(
+                    f"{node.url}/health",
+                    timeout=5
+                )
+                if response.status_code == 200:
+                    node.is_healthy = True
+                    logger.info(f"✅ Node {node.id} is healthy")
+                else:
+                    node.is_healthy = False
+                    logger.warning(f"❌ Node {node.id} unhealthy: {response.status_code}")
+            except Exception as e:
+                node.is_healthy = False
+                logger.warning(f"❌ Node {node.id} unreachable: {e}")
+                
+    def scrape_with_node(self, node: DistributedNode, search_params: Dict) -> Optional[List[Dict]]:
+        """Execute scraping on a specific node"""
+        try:
+            logger.info(f"🔄 Attempting scrape with node {node.id} ({node.provider})")
+            
             headers = {
                 'X-API-Key': self.node_secret,
                 'Content-Type': 'application/json'
             }
             
-            # Prepare search parameters
-            data = {
-                'query': f"{search_params.get('make', '')} {search_params.get('model', '')}".strip(),
-                'location': search_params.get('location', 'Miami'),
-                'min_price': search_params.get('min_price'),
-                'max_price': search_params.get('max_price'),
-                'year_min': search_params.get('year_min'),
-                'year_max': search_params.get('year_max'),
-                'radius': search_params.get('distance_miles', 25)
-            }
+            response = requests.post(
+                f"{node.url}/scrape",
+                json=search_params,
+                headers=headers,
+                timeout=self.timeout
+            )
             
-            logger.info(f"📡 Sending request to node {node['id']}: {data['query']}")
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=data, headers=headers, timeout=30) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        listings = result.get('listings', [])
-                        logger.info(f"✅ Node {node['id']} returned {len(listings)} listings")
-                        return listings
-                    else:
-                        logger.error(f"Node {node['id']} returned status {response.status}")
-                        # Put node in cooldown
-                        self.node_cooldowns[node['id']] = datetime.now() + timedelta(minutes=5)
-                        return []
-                        
-        except Exception as e:
-            logger.error(f"Error with node {node['id']}: {e}")
-            # Put node in cooldown on error
-            self.node_cooldowns[node['id']] = datetime.now() + timedelta(minutes=5)
-            return []
-
-
-class SmartFacebookScraper:
-    """
-    Advanced Facebook scraping strategies to maximize success
-    """
-    
-    def __init__(self, distributed_client: DistributedScraperClient):
-        self.distributed = distributed_client
-        self.strategies = [
-            self._try_distributed_nodes,    # Primary: Use VPS nodes
-            self._try_craigslist_fallback, # Fallback: Craigslist
-            self._try_mock_data            # Last resort: Mock data
-        ]
-        
-    async def search(self, search_params: Dict) -> List[Dict]:
-        """Try multiple strategies in order"""
-        all_listings = []
-        
-        for strategy in self.strategies:
-            try:
-                logger.info(f"🔍 Trying strategy: {strategy.__name__}")
-                listings = await strategy(search_params)
-                
-                if listings:
-                    all_listings.extend(listings)
-                    logger.info(f"✅ Got {len(listings)} listings from {strategy.__name__}")
-                    
-                    # If we got good results from distributed nodes, stop
-                    if strategy.__name__ == '_try_distributed_nodes' and len(listings) >= 5:
-                        break
-                        
-            except Exception as e:
-                logger.error(f"Strategy {strategy.__name__} failed: {e}")
-                continue
-                
-        return all_listings
-        
-    async def _try_distributed_nodes(self, search_params: Dict) -> List[Dict]:
-        """Use distributed VPS nodes"""
-        node = self.distributed.get_next_available_node()
-        
-        if not node:
-            return []
-            
-        return await self.distributed.scrape_with_node(node, search_params)
-        
-    async def _try_craigslist_fallback(self, search_params: Dict) -> List[Dict]:
-        """Fallback to Craigslist (always works)"""
-        try:
-            # Simple Craigslist scraper
-            city = search_params.get('location', 'Miami').split(',')[0].lower()
-            query = f"{search_params.get('make', '')} {search_params.get('model', '')}".strip()
-            
-            url = f"https://{city}.craigslist.org/search/cta"
-            params = {
-                'query': query,
-                'min_price': search_params.get('min_price'),
-                'max_price': search_params.get('max_price'),
-                'min_auto_year': search_params.get('year_min'),
-                'max_auto_year': search_params.get('year_max')
-            }
-            
-            response = requests.get(url, params=params, timeout=10)
-            
-            # Basic parsing (simplified)
-            listings = []
             if response.status_code == 200:
-                # Would parse HTML here
-                logger.info("Craigslist fallback available")
+                data = response.json()
+                results = data.get('results', [])
+                node.success_count += 1
+                logger.info(f"✅ Node {node.id} returned {len(results)} results")
+                return results
+            else:
+                node.failure_count += 1
+                logger.error(f"❌ Node {node.id} returned {response.status_code}")
+                return None
                 
-            return listings
-            
+        except requests.exceptions.Timeout:
+            node.failure_count += 1
+            logger.error(f"⏱️ Node {node.id} timed out")
+            return None
         except Exception as e:
-            logger.error(f"Craigslist fallback failed: {e}")
+            node.failure_count += 1
+            logger.error(f"❌ Node {node.id} error: {e}")
+            return None
+        finally:
+            node.last_used = datetime.now()
+            node.set_cooldown(30)  # 30 second cooldown
+            
+    def scrape_with_fallback(self, search_params: Dict) -> List[Dict]:
+        """Scrape using available nodes with fallback"""
+        available_nodes = self.get_available_nodes()
+        
+        if not available_nodes:
+            logger.warning("⚠️ No available nodes for distributed scraping")
             return []
             
-    async def _try_mock_data(self, search_params: Dict) -> List[Dict]:
-        """Last resort: Return mock data"""
-        if os.getenv('USE_MOCK_DATA', 'false').lower() != 'true':
-            return []
-            
-        mock_listings = []
-        for i in range(5):
-            mock_listings.append({
-                'id': f"mock_{int(time.time())}_{i}",
-                'title': f"2020 {search_params.get('make', 'Toyota')} {search_params.get('model', 'Camry')}",
-                'price': random.randint(15000, 25000),
-                'url': f"https://example.com/mock/{i}",
-                'location': search_params.get('location', 'Miami'),
-                'source': 'mock',
-                'image_url': None,
-                'mileage': random.randint(20000, 60000),
-                'year': random.randint(2018, 2023)
-            })
-            
-        return mock_listings
-
+        # Try nodes in order of success rate
+        for i, node in enumerate(available_nodes[:self.max_retries]):
+            results = self.scrape_with_node(node, search_params)
+            if results:
+                return results
+                
+            # Small delay between retries
+            if i < self.max_retries - 1:
+                time.sleep(2)
+                
+        logger.warning("❌ All distributed nodes failed")
+        return []
 
 class EnhancedCarSearchMonitor:
-    """
-    Drop-in replacement for your existing CarSearchMonitor
-    Uses distributed VPS nodes for better success
-    """
+    """Drop-in replacement for CarSearchMonitor that uses distributed scraping"""
     
-    def __init__(self, use_selenium: bool = False, use_mock_data: bool = False):
+    def __init__(self, use_selenium=True, use_mock_data=False):
         self.use_selenium = use_selenium
         self.use_mock_data = use_mock_data
+        self.distributed_scraper = DistributedScraper()
         
-        # Initialize distributed client
-        self.distributed_client = DistributedScraperClient()
-        self.smart_scraper = SmartFacebookScraper(self.distributed_client)
+        # Health check nodes on startup
+        if self.distributed_scraper.nodes:
+            logger.info("🏥 Running initial health check on nodes...")
+            self.distributed_scraper.health_check_all()
         
-        logger.info(f"✅ Enhanced monitor initialized with {len(self.distributed_client.nodes)} distributed nodes")
+    def search_cars(self, search_config: Dict) -> List[Dict]:
+        """Main search method that uses distributed scraping"""
+        logger.info(f"🚗 Starting distributed search for: {search_config.get('make')} {search_config.get('model')}")
         
-    def monitor_car_search(self, search_config: Dict) -> List[Dict]:
-        """
-        Main method that your existing code calls
-        Now uses distributed scraping!
-        """
-        # Run async search in sync context
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        try:
-            listings = loop.run_until_complete(self.smart_scraper.search(search_config))
+        if self.use_mock_data:
+            return self._generate_mock_results(search_config)
             
-            # Ensure all listings have required fields
-            for listing in listings:
-                listing.setdefault('created_time', datetime.now().isoformat())
-                listing.setdefault('seller_name', 'Unknown')
-                listing.setdefault('source', 'distributed')
+        # Use distributed scraping if nodes are available
+        if self.distributed_scraper.nodes:
+            results = self.distributed_scraper.scrape_with_fallback(search_config)
+            if results:
+                return results
                 
-            return listings
-            
-        finally:
-            loop.close()
-            
-    def cleanup(self):
-        """Cleanup resources"""
-        pass
-
-
-# Monitoring and statistics
-class ScraperMonitor:
-    """Track success rates and performance"""
-    
-    def __init__(self):
-        self.stats = {
-            'total_searches': 0,
-            'successful_searches': 0,
-            'listings_found': 0,
-            'node_performance': {}
-        }
+        # Fallback to basic scraping if no nodes or all failed
+        logger.warning("⚠️ Falling back to direct scraping")
+        return self._basic_facebook_search(search_config)
         
-    def record_search(self, node_id: str, success: bool, listings_count: int):
-        """Record search statistics"""
-        self.stats['total_searches'] += 1
+    def _basic_facebook_search(self, search_config: Dict) -> List[Dict]:
+        """Basic fallback search (likely to be blocked)"""
+        # This is just a placeholder - it will likely fail
+        # The distributed nodes should handle the actual scraping
+        return []
         
-        if success:
-            self.stats['successful_searches'] += 1
-            self.stats['listings_found'] += listings_count
-            
-        # Track per-node performance
-        if node_id not in self.stats['node_performance']:
-            self.stats['node_performance'][node_id] = {
-                'searches': 0,
-                'successes': 0,
-                'listings': 0
-            }
-            
-        node_stats = self.stats['node_performance'][node_id]
-        node_stats['searches'] += 1
-        if success:
-            node_stats['successes'] += 1
-            node_stats['listings'] += listings_count
-            
-    def get_success_rate(self) -> float:
-        """Calculate overall success rate"""
-        if self.stats['total_searches'] == 0:
-            return 0.0
-        return self.stats['successful_searches'] / self.stats['total_searches']
+    def _generate_mock_results(self, search_config: Dict) -> List[Dict]:
+        """Generate mock results for testing"""
+        mock_results = []
+        for i in range(5):
+            mock_results.append({
+                'title': f"{search_config['make']} {search_config['model']} - Test {i+1}",
+                'price': random.randint(5000, 30000),
+                'location': search_config.get('location', 'Unknown'),
+                'url': f"https://example.com/car/{i+1}",
+                'image_url': None,
+                'mileage': random.randint(10000, 150000),
+                'year': random.randint(2010, 2023),
+                'source': 'mock'
+            })
+        return mock_results
         
-    def get_node_stats(self) -> Dict:
-        """Get performance stats for each node"""
-        node_stats = {}
-        
-        for node_id, stats in self.stats['node_performance'].items():
-            success_rate = 0
-            if stats['searches'] > 0:
-                success_rate = stats['successes'] / stats['searches']
-                
-            node_stats[node_id] = {
-                'success_rate': round(success_rate * 100, 2),
-                'total_searches': stats['searches'],
-                'avg_listings': round(stats['listings'] / max(stats['searches'], 1), 2)
-            }
+    def close(self):
+        """Cleanup method"""
+        if hasattr(self.distributed_scraper, 'executor'):
+            self.distributed_scraper.executor.shutdown(wait=False)
             
-        return node_stats
-
-
-# Global monitor instance
-monitor = ScraperMonitor()
+    # Add any other methods from CarSearchMonitor that need to be implemented
+    def test_selenium(self) -> bool:
+        """Test if selenium is working"""
+        # Distributed nodes handle their own Selenium
+        return True
