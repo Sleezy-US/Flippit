@@ -34,6 +34,15 @@ except ImportError:
     ENHANCED_SCRAPER_AVAILABLE = False
     print("⚠️  Enhanced scraper not available, using basic scraper")
 
+# Import distributed scraper
+try:
+    from enhanced_distributed_scraper import EnhancedCarSearchMonitor as DistributedMonitor
+    DISTRIBUTED_SCRAPER_AVAILABLE = True
+    print("✅ Distributed scraper loaded")
+except ImportError:
+    DISTRIBUTED_SCRAPER_AVAILABLE = False
+    print("⚠️ Distributed scraper not available")
+
 # Import the KBB estimator
 from kbb_value_estimator import KBBValueEstimator, enhance_car_listing_with_values
 
@@ -598,9 +607,12 @@ def run_continuous_monitoring():
     """Run car monitoring with subscription tiers and distance limits"""
     global car_monitor
     
-    # Initialize monitor
+    # Initialize monitor if not already done
     if car_monitor is None:
-        if ENHANCED_SCRAPER_AVAILABLE:
+        if DISTRIBUTED_SCRAPER_AVAILABLE and os.getenv('ENABLE_DISTRIBUTED') == 'true':
+            car_monitor = DistributedMonitor(use_selenium=USE_SELENIUM, use_mock_data=USE_MOCK_DATA)
+            print("✅ Using distributed scraper in monitoring thread")
+        elif ENHANCED_SCRAPER_AVAILABLE:
             car_monitor = EnhancedCarSearchMonitor(use_selenium=USE_SELENIUM, use_mock_data=USE_MOCK_DATA)
         else:
             car_monitor = CarSearchMonitor()
@@ -668,7 +680,11 @@ def run_continuous_monitoring():
                             }
                             
                             try:
-                                new_cars = car_monitor.monitor_car_search(search_config)
+                                # Use the appropriate monitor method
+                                if hasattr(car_monitor, 'search_cars'):
+                                    new_cars = car_monitor.search_cars(search_config)
+                                else:
+                                    new_cars = car_monitor.monitor_car_search(search_config)
                                 
                                 # Use mock data if enabled and no real results
                                 if not new_cars and USE_MOCK_DATA:
@@ -709,7 +725,19 @@ async def startup_event():
     init_db()
     update_search_suggestions()
     
-    global monitor_thread
+    global monitor_thread, car_monitor
+    
+    # Initialize the appropriate monitor based on availability
+    if DISTRIBUTED_SCRAPER_AVAILABLE and os.getenv('ENABLE_DISTRIBUTED') == 'true':
+        car_monitor = DistributedMonitor(use_selenium=USE_SELENIUM, use_mock_data=USE_MOCK_DATA)
+        print("✅ Using distributed scraper with VPS nodes")
+    elif ENHANCED_SCRAPER_AVAILABLE:
+        car_monitor = EnhancedCarSearchMonitor(use_selenium=USE_SELENIUM, use_mock_data=USE_MOCK_DATA)
+        print("⚠️ Enhanced scraper available but distributed disabled")
+    else:
+        car_monitor = CarSearchMonitor()
+        print("⚠️ Using basic scraper")
+    
     if monitor_thread is None:
         monitor_thread = threading.Thread(target=run_continuous_monitoring, daemon=True)
         monitor_thread.start()
@@ -1661,6 +1689,66 @@ async def test_car_search(search_id: int, user_id: int = Depends(verify_token)):
         "sample_car": mock_cars[0] if mock_cars else None
     }
 
+@app.get("/test-vps")
+async def test_vps_connection():
+    """Test connection to VPS nodes"""
+    import requests
+    
+    nodes = json.loads(os.getenv('DISTRIBUTED_NODES', '[]'))
+    node_secret = os.getenv('NODE_SECRET', '')
+    results = []
+    
+    for node in nodes:
+        try:
+            # Test health endpoint
+            health_response = requests.get(f"{node['url']}/health", timeout=5)
+            
+            # Test scraping endpoint
+            test_response = requests.post(
+                f"{node['url']}/test",
+                headers={'X-API-Key': node_secret},
+                timeout=5
+            )
+            
+            results.append({
+                "node": node['id'],
+                "status": "connected",
+                "health": health_response.json() if health_response.status_code == 200 else "failed",
+                "test": test_response.json() if test_response.status_code == 200 else "failed"
+            })
+        except Exception as e:
+            results.append({
+                "node": node.get('id', 'unknown'),
+                "status": "failed",
+                "error": str(e)
+            })
+    
+    return {
+        "distributed_enabled": os.getenv('ENABLE_DISTRIBUTED') == 'true',
+        "node_secret_configured": bool(node_secret),
+        "nodes": results,
+        "total_nodes": len(nodes),
+        "working_nodes": len([n for n in results if n['status'] == 'connected'])
+    }
+
+@app.get("/scraper-status")
+async def get_scraper_status():
+    """Get current scraper configuration status"""
+    return {
+        "basic_scraper": True,
+        "enhanced_scraper": ENHANCED_SCRAPER_AVAILABLE,
+        "distributed_scraper": DISTRIBUTED_SCRAPER_AVAILABLE,
+        "distributed_enabled": os.getenv('ENABLE_DISTRIBUTED') == 'true',
+        "active_scraper": (
+            "distributed" if DISTRIBUTED_SCRAPER_AVAILABLE and os.getenv('ENABLE_DISTRIBUTED') == 'true'
+            else "enhanced" if ENHANCED_SCRAPER_AVAILABLE
+            else "basic"
+        ),
+        "vps_nodes": len(json.loads(os.getenv('DISTRIBUTED_NODES', '[]'))),
+        "selenium_enabled": USE_SELENIUM,
+        "mock_data_enabled": USE_MOCK_DATA
+    }
+
 @app.get("/config")
 async def get_config():
     """Get current configuration"""
@@ -1669,6 +1757,9 @@ async def get_config():
         "use_mock_data": USE_MOCK_DATA,
         "use_selenium": USE_SELENIUM,
         "enhanced_scraper": ENHANCED_SCRAPER_AVAILABLE,
+        "distributed_scraper": DISTRIBUTED_SCRAPER_AVAILABLE,
+        "distributed_enabled": os.getenv('ENABLE_DISTRIBUTED') == 'true',
+        "vps_nodes": len(json.loads(os.getenv('DISTRIBUTED_NODES', '[]'))),
         "version": "3.2.0",
         "features": {
             "ios_iap": True,
@@ -1676,7 +1767,8 @@ async def get_config():
             "kbb_values": True,
             "deal_scoring": True,
             "market_insights": True,
-            "mock_data": USE_MOCK_DATA
+            "mock_data": USE_MOCK_DATA,
+            "distributed_scraping": DISTRIBUTED_SCRAPER_AVAILABLE and os.getenv('ENABLE_DISTRIBUTED') == 'true'
         },
         "year_limits": {
             "min": MIN_CAR_YEAR,
