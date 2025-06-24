@@ -102,16 +102,33 @@ class DistributedScraper:
                 'Content-Type': 'application/json'
             }
             
+            # Format the request correctly for the VPS
+            # The VPS expects 'query' and 'location' fields
+            request_data = {
+                "query": f"{search_params.get('make', '')} {search_params.get('model', '')}".strip(),
+                "location": search_params.get('location', 'Miami, FL')
+            }
+            
+            # Add optional parameters if they exist
+            if search_params.get('price_min'):
+                request_data['price_min'] = search_params['price_min']
+            if search_params.get('price_max'):
+                request_data['price_max'] = search_params['price_max']
+            if search_params.get('year_min'):
+                request_data['year_min'] = search_params['year_min']
+            if search_params.get('year_max'):
+                request_data['year_max'] = search_params['year_max']
+            
             response = requests.post(
                 f"{node.url}/scrape",
-                json=search_params,
+                json=request_data,
                 headers=headers,
                 timeout=self.timeout
             )
             
             if response.status_code == 200:
                 data = response.json()
-                results = data.get('results', [])
+                results = data.get('listings', [])  # Changed from 'results' to 'listings'
                 node.success_count += 1
                 logger.info(f"✅ Node {node.id} returned {len(results)} results")
                 return results
